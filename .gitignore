@@ -2,3 +2,4 @@
 .venv
 .idea
 wsl.localhost
+**/__pycache__/

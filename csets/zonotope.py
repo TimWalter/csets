@@ -205,7 +205,7 @@ class Zonotope:
     def _make_contains_point(self: ZonotopeType["d"]) -> MoreauSolver:
         r"""
         Build a solver for the point containment problem of a zonotope, namely
-        $1\geq\min_{\beta\in\mathbb{R}^n} \norm{\beta}_\infty\,, \text{s.t.} p=c+G\beta.
+        $1\geq\min_{\beta\in\mathbb{R}^n} \norm{\beta}_\infty\,, \text{s.t.} point=c+G\beta.
         We canonicalise to:
             min_z q^T z
             s.t. A z + s = b, s \in K
@@ -265,17 +265,12 @@ class Zonotope:
                                 inner: ZonotopeType["d"]
                                 ) -> MoreauSolver:
         r"""
-        Build a solver for the zonotope containment problem of an inner zonotope
-        $Z_2 = \langle c_2, G_2 \rangle$ with m generators in the outer zonotope
-        $Z_1 = \langle c_1, G_1 \rangle$ with n generators:
-            min_{\Gamma, \beta, t} t
-            s.t. G_1 \Gamma = G_2
-                 G_1 \beta = c_1 - c_2
-                 \| [\Gamma, \beta] \|_\infty <= t
-        with the matrix infinity norm, i.e. the largest absolute row sum. $Z_2 \subseteq Z_1$ if
-        t <= 1. See Sadraddini, S., Tedrake, R. (2019): "Linear Encodings for Polytope Containment
-        Problems", Sec. IV. The encoding is sufficient but not necessary: exact zonotope containment
-        is co-NP-complete, so a contained pair may still be reported as not contained.
+        Build a solver for the zonotope containment problem of a zonotope, namely
+        $$
+        1\geq\min_{\beta\in\mathbb{R}^n_s, \Gamma\in\mathbb{R}^{n_s\times n_i}} \norm{[\beta, \Gamma]}_\infty
+        \text{s.t.} G_i=G_s\Gamma
+        c_s-c_i=G_s\beta
+        $$
         We canonicalise the row sums through auxiliary variables U >= |\Gamma| and V >= |\beta| to:
             min_z q^T z
             s.t. A z + s = b, s \in K
@@ -288,11 +283,10 @@ class Zonotope:
             2 n rows:   +-\beta - V <= 0                   (non-negative cone)
             n rows:     \sum_j U_kj + V_k - t <= 0         (non-negative cone)
 
-        The equality blocks are infeasible whenever the generators of the inner zonotope leave the
-        span of the outer ones, so the check is well-posed only for a full-dimensional `self`.
+        The encoding is sufficient but not necessary: exact zonotope containment is co-NP-complete, so a contained pair
+        may still be reported as not contained.
 
-        Args:
-            inner: A zonotope of the shape later passed to `contains`; only its shape is read.
+        See Sadraddini, S., Tedrake, R. (2019): "Linear Encodings for Polytope Containment Problems", Eq. (5)
 
         Returns:
             A moreau solver; consume it through `contains`.
@@ -307,20 +301,17 @@ class Zonotope:
         P_row_offsets = jnp.zeros(num_variables + 1, dtype=jnp.int32)
         P_col_indices = jnp.array([], dtype=jnp.int32)
 
-        # Equality rows hold one entry per outer generator, bound rows a variable and its auxiliary,
-        # and each row-sum row the m auxiliaries of one row of Gamma plus V_k and t.
         row_sizes = jnp.concat([jnp.full(num_zero_cones, n, dtype=jnp.int32),
                                 jnp.full(2 * n * m + 2 * n, 2, dtype=jnp.int32),
                                 jnp.full(n, m + 2, dtype=jnp.int32)])
         A_row_offsets = jnp.concat([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(row_sizes)])
 
-        mapping_cols = jnp.arange(n * m)  # Gamma_kj lives at k m + j.
+        mapping_cols = jnp.arange(n * m)
         weight_cols = n * m + jnp.arange(n)
         abs_mapping_cols = n * m + n + mapping_cols
         abs_weight_cols = 2 * n * m + n + jnp.arange(n)
         t_col = 2 * n * m + 2 * n
 
-        # Row (i, j) of the shape block touches Gamma_kj for every k, i.e. j + m k.
         shape_cols = jnp.tile((jnp.arange(m)[:, None] + m * jnp.arange(n)[None, :]).flatten(), d)
         centre_cols = jnp.tile(weight_cols, d)
         mapping_bound_cols = jnp.stack([mapping_cols, abs_mapping_cols], axis=1).flatten()
