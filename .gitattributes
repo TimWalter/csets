@@ -1,0 +1,3 @@
+# Normalize line endings; the CORA-COMP scripts run on Linux workers.
+* text=auto eol=lf
+*.sh text eol=lf

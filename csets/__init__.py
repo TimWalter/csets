@@ -8,6 +8,7 @@ from moreau.jax import Solver, Settings
 @dataclass
 class Config:
     enable_grad: bool = True
+    device: str | None = None  # Moreau device ('cpu' or 'cuda'); None picks by problem size.
 
 
 config = Config()
@@ -31,7 +32,10 @@ class MoreauSolver(Solver):
         """
         if settings is None:
             settings = Settings()
-        settings.device = 'cpu' if n < 500 else 'auto'  # Moreau to eagerly assign GPU
+        if config.device is not None:
+            settings.device = config.device
+        else:
+            settings.device = 'cpu' if n < 500 else 'auto'  # Moreau to eagerly assign GPU
         settings.enable_grad = config.enable_grad
         super().__init__(n=n, settings=settings, **kwargs)
         if auto_tune_call is not None:
