@@ -11,9 +11,12 @@
 # A column added to the catalog later arrives as a further argument, in file order, and
 # the results file to write is always the LAST argument.
 #
-# Everything this script does is timed by the harness. The work itself is in
-# benchmark/cora_comp.py, which dispatches on params; this wrapper only selects the JAX
-# backend and guarantees a verdict is written even if the driver crashes.
+# Everything this script does is timed by the harness, so it only hands params to the warm
+# daemon started by prepare_instance.sh and waits for the verdict; the daemon generates the
+# inputs and repeats the operation (benchmark/cora_comp.py). Without a daemon, the instance
+# runs in a fresh process instead, paying Python, imports and compilation inside the measurement.
+
+set -u
 
 VERSION_STRING="v1"
 if [ "$1" != "$VERSION_STRING" ]; then
@@ -21,30 +24,38 @@ if [ "$1" != "$VERSION_STRING" ]; then
     exit 1
 fi
 
-BENCHMARK="$2"
-INSTANCE="$3"
+case "$0" in */*) HERE="${0%/*}" ;; *) HERE=. ;; esac  # no subshell: this is measured
+. "$HERE/benchmark/client.sh"
+
 PARAMS="$4"
 RESULTS_FILE="${@: -1}"
 
-cd "$(dirname "$0")"
+ask "run	$RESULTS_FILE	$PARAMS"
+case $? in
+    0)  # The daemon's log only matters when the instance did not finish.
+        [ "$REPLY" = finished ] || cat "$SRV_DIR/job.log"
+        exit 0 ;;
+    1)  echo "[run] no csets daemon; running directly" ;;
+    *)  echo "[run] the csets daemon died during the instance"
+        cat "$SRV_DIR/job.log"
+        printf 'result\nerror\n' > "$RESULTS_FILE"
+        exit 0 ;;
+esac
 
-DEVICE=$(printf '%s' "$PARAMS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device"])')
-echo "Running $BENCHMARK/$INSTANCE on $DEVICE -> $RESULTS_FILE"
-
-# cpu instances must never touch the GPU, so JAX only gets the CPU backend. gpu instances
-# keep the CPU backend too: Moreau's JAX bindings stage through host callbacks that need it.
-if [ "$DEVICE" = gpu ]; then
-    export JAX_PLATFORMS=cuda,cpu
-else
-    export JAX_PLATFORMS=cpu
-fi
+# Fallback: a fresh process. cpu instances must never touch the GPU, so JAX only gets the CPU
+# backend; gpu instances keep the CPU backend too, since Moreau's JAX bindings need it.
+cd "$HERE"
+PYTHON=.venv/bin/python
+case "$PARAMS" in
+    *'"device": "gpu"'*|*'"device":"gpu"'*) export JAX_PLATFORMS=cuda,cpu ;;
+    *) export JAX_PLATFORMS=cpu ;;
+esac
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONWARNINGS=ignore
 
 rm -f "$RESULTS_FILE"
-.venv/bin/python benchmark/cora_comp.py "$PARAMS" "$RESULTS_FILE"
+"$PYTHON" benchmark/cora_comp.py "$PARAMS" "$RESULTS_FILE"
 STATUS=$?
-
 if [ $STATUS -ne 0 ] || [ ! -s "$RESULTS_FILE" ]; then
     echo "Driver exited with status $STATUS; reporting error."
     printf 'result\nerror\n' > "$RESULTS_FILE"

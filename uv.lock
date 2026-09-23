@@ -64,6 +64,7 @@ dependencies = [
     { name = "chex" },
     { name = "jax", extra = ["cuda13"] },
     { name = "jaxtyping" },
+    { name = "linrax" },
     { name = "moreau", extra = ["cuda13"] },
     { name = "pytest" },
 ]
@@ -74,6 +75,7 @@ requires-dist = [
     { name = "chex", specifier = ">=0.1.92" },
     { name = "jax", extras = ["cuda13"], specifier = ">=0.10.1" },
     { name = "jaxtyping", specifier = ">=0.3.9" },
+    { name = "linrax", specifier = ">=0.3.0" },
     { name = "moreau", extras = ["cuda13"], specifier = "==0.4.0" },
     { name = "pytest", specifier = ">=9.1.0" },
 ]
@@ -219,6 +221,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/91/c1/091b8852bd7cbf50bd655543c8506033cf4029300c67f8c176c1286879a9/jaxtyping-0.3.11.tar.gz", hash = "sha256:b09c14acf6686feb9e0df5b0d8c6e7c5b6f8d36bf059ee54cd522a186c2ef050", size = 46489, upload-time = "2026-06-13T18:35:23.167Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/38/c66bbdc5047f4776c2bd3e47e5295a350e3fa44d5b8942105e71c2a876a0/jaxtyping-0.3.11-py3-none-any.whl", hash = "sha256:8a4bedc4e3f963fa82df41bd13c7ebc2bad925601eb48614c65798f21329d4e3", size = 56593, upload-time = "2026-06-13T18:35:22.01Z" },
+]
+
+[[package]]
+name = "linrax"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jax" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/2a/001d6ecf4993d6cc47792e22d31a6ea0e72b7abb04899dd84c411c9624dd/linrax-0.3.0.tar.gz", hash = "sha256:7c36334ae28ea59afffc6de03470c66c335d7a1f7ee5ac9a1ab8d73558a4bb62", size = 105928, upload-time = "2026-05-24T02:57:57.875Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/59/0fa70ea13c29bb675b324e1cf506c3123d76719715a1e851ad007d7dc9c8/linrax-0.3.0-py3-none-any.whl", hash = "sha256:0185c8a561153e4f9f3d8e2e5ba1e6c9304442f4aaeee4e15558052e8cb3dc04", size = 5487, upload-time = "2026-05-24T02:57:56.433Z" },
 ]
 
 [[package]]

@@ -1,10 +1,18 @@
 """
-CORA-COMP driver: runs one benchmark instance with csets and writes the verdict.
+CORA-COMP driver: one benchmark instance with csets, split into what may happen before the
+measurement and what has to happen inside it.
 
-Called by run_instance.sh as `python cora_comp.py <params-json> <result-file>`. Everything
-here is timed by the harness, so the script does exactly what the catalog defines: generate
-the inputs, move them to the device, then perform the operation `repetition` times.
-See https://github.com/CORA-COMP/benchmarks for the operations.
+- `Instance(params)` and `Instance.compile()` are shape-only setup: they pin the device, build
+  the Moreau solver (its sparsity structure depends on the dimensions alone) and compile the
+  input generator and the repeated operation ahead of time from `jax.ShapeDtypeStruct`s.
+  Nothing of the instance is generated here. The daemon (benchmark/server.py) does this in
+  the untimed prepare_instance.sh, as the other JAX entries do.
+- `run_instance(...)` is the measured part: generate the inputs on the device, then perform
+  the operation `repetition` times, and write the verdict.
+
+Without a daemon, run_instance.sh calls this file directly
+(`python cora_comp.py <params-json> <result-file>`), and compilation happens lazily inside the
+measurement. See https://github.com/CORA-COMP/benchmarks for the operations.
 
 Batched benchmarks (`batch_size` present) apply the operation to the whole batch in one
 `jax.vmap`ped call; unbatched ones call the library directly.
@@ -20,6 +28,7 @@ import csets
 from csets import Zonotope
 
 FINISHED, UNSUPPORTED, ERROR = "finished", "unsupported", "error"
+SEED = 0  # every instance starts from the same key, so a warm daemon behaves like a fresh process
 
 
 def write_result(path: str, verdict: str, **extra: float) -> None:
@@ -42,112 +51,177 @@ def unit_directions(key, batch: int | None, dim: int):
     return d / jnp.linalg.norm(d, axis=-1, keepdims=True)
 
 
-def build(params: dict, key):
+def programs(params: dict):
     """
-    Return (inputs, op) for the instance: `inputs` is generated before the loop and `op(key, *inputs)`
-    is the repeated call; `key` differs per repetition so random operations draw fresh samples.
+    Return `(generate, operation)` for the instance, both still to be jitted:
+    `generate()` makes the inputs, and `operation(i, inputs)` is repetition `i`, which folds `i`
+    into its key so random operations draw fresh numbers each time.
     """
     operation = params["operation"]
     dim, generators = params["dim"], params["generators"]
     batch = params.get("batch_size")  # absent on the unbatched benchmarks
-    k1, k2, k3 = jax.random.split(key, 3)
+
+    def input_keys():
+        return jax.random.split(jax.random.PRNGKey(SEED), 2)
+
+    def rep_key(i):
+        return jax.random.fold_in(jax.random.PRNGKey(SEED + 1), i)
 
     if operation == "startup":
-        return (), lambda k: Zonotope.random(k, dim=dim, nr_generators=generators)
+        return (lambda: ()), lambda i, _: Zonotope.random(rep_key(i), dim=dim, nr_generators=generators)
 
     if operation == "generateRandom":
-        return (), lambda k: random_zonotopes(k, batch, dim, generators)
+        return (lambda: ()), lambda i, _: random_zonotopes(rep_key(i), batch, dim, generators)
 
     if operation == "randPoint":
         points = params["points"]
-        z = random_zonotopes(k1, batch, dim, generators)
+
+        def generate():
+            return (random_zonotopes(input_keys()[0], batch, dim, generators),)
+
         if batch is None:
-            return (z,), lambda k, z: z.sample(k, points)
-        return (z,), lambda k, z: jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k, batch))
+            return generate, lambda i, inputs: inputs[0].sample(rep_key(i), points)
+        return generate, lambda i, inputs: jax.vmap(lambda zi, ki: zi.sample(ki, points))(
+            inputs[0], jax.random.split(rep_key(i), batch))
 
     if operation == "supportFunc":
-        z = random_zonotopes(k1, batch, dim, generators)
-        d = unit_directions(k2, batch, dim)
+        def generate():
+            k1, k2 = input_keys()
+            return random_zonotopes(k1, batch, dim, generators), unit_directions(k2, batch, dim)
+
         if batch is None:
-            return (z, d), lambda k, z, d: z.support(d)
-        return (z, d), lambda k, z, d: jax.vmap(lambda zi, di: zi.support(di))(z, d)
+            return generate, lambda i, inputs: inputs[0].support(inputs[1])
+        return generate, lambda i, inputs: jax.vmap(lambda zi, di: zi.support(di))(*inputs)
 
     if operation == "matMul":
-        z = random_zonotopes(k1, batch, dim, generators)
-        m = jax.random.normal(k2, (dim, dim))  # one matrix for the whole batch, per the catalog
+        def generate():
+            k1, k2 = input_keys()
+            # one matrix for the whole batch, per the catalog
+            return jax.random.normal(k2, (dim, dim)), random_zonotopes(k1, batch, dim, generators)
+
         if batch is None:
-            return (m, z), lambda k, m, z: m @ z
-        return (m, z), lambda k, m, z: jax.vmap(lambda zi: m @ zi)(z)
+            return generate, lambda i, inputs: inputs[0] @ inputs[1]
+        return generate, lambda i, inputs: jax.vmap(lambda zi: inputs[0] @ zi)(inputs[1])
 
     if operation == "minkSum":
-        z1 = random_zonotopes(k1, batch, dim, generators)
-        z2 = random_zonotopes(k2, batch, dim, generators)
+        def generate():
+            k1, k2 = input_keys()
+            return random_zonotopes(k1, batch, dim, generators), random_zonotopes(k2, batch, dim, generators)
+
         if batch is None:
-            return (z1, z2), lambda k, z1, z2: z1.minkowski_sum(z2)
-        return (z1, z2), lambda k, z1, z2: jax.vmap(lambda a, b: a.minkowski_sum(b))(z1, z2)
+            return generate, lambda i, inputs: inputs[0].minkowski_sum(inputs[1])
+        return generate, lambda i, inputs: jax.vmap(lambda a, b: a.minkowski_sum(b))(*inputs)
 
     if operation == "contains":
         points = params["points"]
-        z = random_zonotopes(k1, batch, dim, generators)
+        # The solver's structure depends on the shapes only, so it is built from zeros of the
+        # instance's shape, not from the instance's sets.
+        example = Zonotope(centre=jnp.zeros(dim), generator=jnp.zeros((dim, generators)))
+        solver = example.make_contains(jnp.zeros(dim))
+
         if batch is None:
-            p = z.sample(k2, points)
-            solver = z.make_contains(p[0])
-            return (z, p), lambda k, z, p: jax.vmap(lambda pi: z.contains(pi, solver))(p)
+            def generate():
+                k1, k2 = input_keys()
+                z = random_zonotopes(k1, batch, dim, generators)
+                return z, z.sample(k2, points)
+
+            return generate, lambda i, inputs: jax.vmap(lambda pi: inputs[0].contains(pi, solver))(inputs[1])
+
         # `points` points per set, drawn from that set. Moreau batches over one leading axis,
         # so the (batch, points) pairs are flattened into one batch of batch*points solves.
-        p = jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k2, batch))
-        solver = jax.tree.map(lambda x: x[0], z).make_contains(p[0, 0])
-        z_flat = jax.tree.map(lambda x: jnp.repeat(x, points, axis=0), z)
-        p_flat = p.reshape(batch * points, dim)
-        return (z_flat, p_flat), lambda k, z, p: jax.vmap(lambda zi, pi: zi.contains(pi, solver))(z, p)
+        def generate():
+            k1, k2 = input_keys()
+            z = random_zonotopes(k1, batch, dim, generators)
+            p = jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k2, batch))
+            z_flat = jax.tree.map(lambda x: jnp.repeat(x, points, axis=0), z)
+            return z_flat, p.reshape(batch * points, dim)
+
+        return generate, lambda i, inputs: jax.vmap(lambda zi, pi: zi.contains(pi, solver))(*inputs)
 
     raise ValueError(f"Unknown operation '{operation}'")
 
 
-def main() -> int:
-    params = json.loads(sys.argv[1])
-    result_file = sys.argv[2]
-
-    if params["set"] != "zonotope":
-        print(f"csets has no {params['set']} representation; reporting unsupported.")
-        write_result(result_file, UNSUPPORTED)
-        return 0
-
-    device_kind = params["device"]
+def configure(params: dict):
+    """Return the JAX device for the instance (None if there is none) and pin csets to it."""
     try:
-        device = jax.devices("cuda" if device_kind == "gpu" else "cpu")[0]
+        device = jax.devices("cuda" if params["device"] == "gpu" else "cpu")[0]
     except RuntimeError:
-        print(f"No {device_kind} device available to JAX; reporting unsupported.")
-        write_result(result_file, UNSUPPORTED)
-        return 0
-
+        return None
     # Pin the Moreau solver to the instance's device too; by default csets picks by problem size.
-    csets.config.device = "cuda" if device_kind == "gpu" else "cpu"
+    csets.config.device = "cuda" if params["device"] == "gpu" else "cpu"
     csets.config.enable_grad = False
+    return device
 
-    repetition = params["repetition"]
-    key = jax.random.PRNGKey(0)
-    setup_key, *rep_keys = jax.random.split(key, repetition + 1)
 
-    with jax.default_device(device):
-        t0 = time.perf_counter()
-        inputs, op = build(params, setup_key)
-        inputs = jax.device_put(inputs, device)
-        jax.block_until_ready(inputs)
-        t1 = time.perf_counter()
+class Instance:
+    """One catalog instance: shape-only setup in the constructor and `compile`, the measured part in `run`."""
 
-        op = jax.jit(op)
-        for i in range(repetition):
-            output = op(rep_keys[i], *inputs)  # overwritten each time, like `Z2 = M * Z` in CORA
-        jax.block_until_ready(output)  # like wait(gpuDevice): calls return before the work is done
-        t2 = time.perf_counter()
+    def __init__(self, params: dict):
+        self.params = params
+        self.unsupported = None
+        if params["set"] != "zonotope":
+            self.unsupported = f"csets has no {params['set']} representation"
+            return
+        self.device = configure(params)
+        if self.device is None:
+            self.unsupported = f"no {params['device']} device available to JAX"
+            return
+        with jax.default_device(self.device):
+            generate, operation = programs(params)
+        # Moreau's JAX bindings find their solver through a weak registry, and a compiled program
+        # holds only the solver's id; these closures are what keeps the solver alive.
+        self._programs = generate, operation
+        self.generate, self.operation = jax.jit(generate), jax.jit(operation)
 
+    def compile(self) -> None:
+        """Compile both programs from shapes alone; no input is generated."""
+        if self.unsupported:
+            return
+        with jax.default_device(self.device):
+            lowered = self.generate.lower()
+            shapes = lowered.out_info
+            self.generate = lowered.compile()
+            self.operation = self.operation.lower(0, shapes).compile()
+
+    def run(self):
+        """Generate the inputs, then repeat the operation; return (time_generate, time_operation, output)."""
+        with jax.default_device(self.device):
+            t0 = time.perf_counter()
+            inputs = self.generate()
+            jax.block_until_ready(inputs)
+            t1 = time.perf_counter()
+            for i in range(self.params["repetition"]):
+                output = self.operation(i, inputs)  # overwritten each time, like `Z2 = M * Z` in CORA
+            jax.block_until_ready(output)  # like wait(gpuDevice): calls return before the work is done
+            t2 = time.perf_counter()
+        return t1 - t0, t2 - t1, output
+
+
+def run_instance(instance: Instance, result_file: str) -> str:
+    """The measured part: run the instance and write its verdict, which is also returned."""
+    params = instance.params
+    if instance.unsupported:
+        print(f"{instance.unsupported}; reporting unsupported.")
+        write_result(result_file, UNSUPPORTED)
+        return UNSUPPORTED
+
+    time_generate, time_operation, output = instance.run()
+
+    verdict = FINISHED
     if params["operation"] == "contains":
-        # Every point was drawn from the set, so every answer must be true.
-        print(f"contains: {int(output.sum())}/{output.size} true")
+        # Every point was drawn from its set, so every answer must be true.
+        n_true = int(output.sum())
+        print(f"contains: {n_true}/{output.size} true")
+        if n_true != output.size:
+            verdict = ERROR
 
-    write_result(result_file, FINISHED, time_generate=t1 - t0, time_operation=t2 - t1)
-    print(f"finished: generate {t1 - t0:.3f}s, operation {t2 - t1:.3f}s ({repetition} reps)")
+    write_result(result_file, verdict, time_generate=time_generate, time_operation=time_operation)
+    print(f"{verdict}: generate {time_generate:.3f}s, operation {time_operation:.3f}s ({params['repetition']} reps)")
+    return verdict
+
+
+def main() -> int:
+    run_instance(Instance(json.loads(sys.argv[1])), sys.argv[2])
     return 0
 
 
