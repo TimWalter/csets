@@ -114,10 +114,10 @@ def programs(params: dict):
 
     if operation == "contains":
         points = params["points"]
-        # The solver's structure depends on the shapes only, so it is built from zeros of the
-        # instance's shape, not from the instance's sets.
+        # The containment check depends on the shapes only, so it is set up from zeros of the
+        # instance's shape, not from the instance's sets. It takes all points of a set at once.
         example = Zonotope(centre=jnp.zeros(dim), generator=jnp.zeros((dim, generators)))
-        solver = example.make_contains(jnp.zeros(dim))
+        solver = example.make_contains(jnp.zeros((points, dim)))
 
         if batch is None:
             def generate():
@@ -125,16 +125,13 @@ def programs(params: dict):
                 z = random_zonotopes(k1, batch, dim, generators)
                 return z, z.sample(k2, points)
 
-            return generate, lambda i, inputs: jax.vmap(lambda pi: inputs[0].contains(pi, solver))(inputs[1])
+            return generate, lambda i, inputs: inputs[0].contains(inputs[1], solver)
 
-        # `points` points per set, drawn from that set. Moreau batches over one leading axis,
-        # so the (batch, points) pairs are flattened into one batch of batch*points solves.
+        # `points` points per set, drawn from that set.
         def generate():
             k1, k2 = input_keys()
             z = random_zonotopes(k1, batch, dim, generators)
-            p = jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k2, batch))
-            z_flat = jax.tree.map(lambda x: jnp.repeat(x, points, axis=0), z)
-            return z_flat, p.reshape(batch * points, dim)
+            return z, jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k2, batch))
 
         return generate, lambda i, inputs: jax.vmap(lambda zi, pi: zi.contains(pi, solver))(*inputs)
 
@@ -169,7 +166,8 @@ class Instance:
         with jax.default_device(self.device):
             generate, operation = programs(params)
         # Moreau's JAX bindings find their solver through a weak registry, and a compiled program
-        # holds only the solver's id; these closures are what keeps the solver alive.
+        # holds only the solver's id; these closures are what keeps the solver (the containment
+        # check's LP fallback) alive.
         self._programs = generate, operation
         self.generate, self.operation = jax.jit(generate), jax.jit(operation)
 

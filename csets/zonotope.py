@@ -8,6 +8,7 @@ from moreau.jax import Cones, Settings
 from jaxtyping import Array, Float, Bool, PRNGKeyArray
 
 from . import MoreauSolver, SetType, ContinuousSetType
+from .containment import PointContainment
 from .utils import safe_norm
 
 ZonotopeType = SetType("Zonotope")
@@ -156,110 +157,55 @@ class Zonotope:
         )
 
     def make_contains(self: ZonotopeType["d"],
-                      inner: ContinuousSetType["d"] | Float[Array, "d"],
-                      ) -> MoreauSolver:
+                      inner: ContinuousSetType["d"] | Float[Array, "*n d"],
+                      ) -> MoreauSolver | PointContainment:
         r"""
-        Set up the optimisation problem for the containment check, reusable across calls as long as the
-        shapes and type stay the same.
+        Set up the containment check, reusable across calls as long as the shapes and type stay the same.
 
         Args:
-            inner: An example of the kind of continuous set or point, whose containment to check.
+            inner: An example of the kind of continuous set or point(s), whose containment to check.
 
         Returns:
-            A moreau solver; consume it through `contains`.
+            For a zonotope, a moreau solver; for points, a `PointContainment` for zonotopes of this
+            shape (any number of points). Consume either through `contains`.
         """
         if isinstance(inner, Zonotope):
             return self._make_contains_zonotope(inner)
         elif isinstance(inner, Array):
-            return self._make_contains_point()
+            return PointContainment(*self.generator.shape)
         else:
             raise TypeError(f"Unsupported type for inner: {type(inner)}")
 
     def contains(self: ZonotopeType["d"],
-                 inner: ContinuousSetType["d"] | Float[Array, "d"],
-                 solver: MoreauSolver
-                 ) -> Bool[Array, ""]:
+                 inner: ContinuousSetType["d"] | Float[Array, "*n d"],
+                 solver: MoreauSolver | PointContainment
+                 ) -> Bool[Array, "*n"]:
         """
-        Checks if a continuous set or point is contained in the zonotope.
+        Checks if a continuous set, a point, or each of several points is contained in the zonotope.
 
         The solver must have been constructed via `make_contains` with an `inner` of the same type
-        and shape, and with a zonotope of the same shape as `self`.
+        (and, for zonotopes, shape), and with a zonotope of the same shape as `self`.
 
         Args:
-            inner: The continuous set or point to check.
-            solver: Pre-compiled moreau solver.
+            inner: The continuous set, point (d,) or points (n, d) to check.
+            solver: What `make_contains` returned.
 
         Returns:
-            Flag indicating containment.
+            Flag indicating containment, one per point for several points.
 
         Notes:
+            Points are decided exactly (see `csets.containment`), all points of a call at once,
+            which is also what makes several points cheaper than one call each. The answer is not
+            differentiable.
             Could also override the __contains__ operator.
         """
         if isinstance(inner, Zonotope):
             return self._contains_zonotope(inner, solver)
         elif isinstance(inner, Array):
-            return self._contains_point(inner, solver)
+            points = inner.reshape(-1, inner.shape[-1])
+            return solver(self.centre, self.generator, points).reshape(inner.shape[:-1])
         else:
             raise TypeError(f"Unsupported type for inner: {type(inner)}")
-
-    def _make_contains_point(self: ZonotopeType["d"]) -> MoreauSolver:
-        r"""
-        Build a solver for the point containment problem of a zonotope, namely
-        $1\geq\min_{\beta\in\mathbb{R}^n} \norm{\beta}_\infty\,, \text{s.t.} point=c+G\beta.
-        We canonicalise to:
-            min_z q^T z
-            s.t. A z + s = b, s \in K
-
-        with z=[\beta, t], q=[\bm{0}, 1], A=[[G, \bm{0}],
-                                             [I, -\bm{1}],
-                                             [-I, -\bm{1}]],
-        b=[p - c, \bm{0}, \bm{0}], and K a zero cone of dimension d followed by a non-negative cone.
-        See Kulmburg, A., Althoff, M. (2021): "On the co-NP-Completeness of the Zonotope Containment Problem", Eq. (6).
-
-        Returns:
-            A moreau solver; consume it through `contains`.
-        """
-        d, n = self.generator.shape
-
-        P_row_offsets = jnp.zeros(n + 2, dtype=jnp.int32)
-        P_col_indices = jnp.array([], dtype=jnp.int32)
-
-        A_row_offsets = jnp.concat([jnp.arange(0, d * n + 1, n), d * n + jnp.arange(2, 4 * n + 1, 2)])
-        bound_cols = jnp.stack([jnp.arange(n), jnp.full(n, n)], axis=1).flatten()
-        A_col_indices = jnp.concat([jnp.tile(jnp.arange(n), d), bound_cols, bound_cols])
-
-        cones = Cones(num_zero_cones=d, num_nonneg_cones=2 * n)
-
-        return MoreauSolver(n=n + 1, m=d + 2 * n,
-                            P_row_offsets=P_row_offsets, P_col_indices=P_col_indices,
-                            A_row_offsets=A_row_offsets, A_col_indices=A_col_indices,
-                            cones=cones,
-                            settings=Settings(solver='active_set'))
-
-    def _contains_point(self: ZonotopeType["d"],
-                        point: Float[Array, "d"],
-                        solver: MoreauSolver
-                        ) -> Bool[Array, ""]:
-        """
-        Check whether a point is contained in the zonotope, up to the solver tolerance.
-
-        Args:
-            point: The point to check.
-            solver: Pre-compiled moreau solver, constructed via `_make_contains_point`.
-
-        Returns:
-            Flag indicating containment.
-        """
-        n = self.generator.shape[1]
-
-        p = jnp.array([])
-        a = jnp.concat([self.generator.flatten(),
-                        jnp.tile(jnp.array([1.0, -1.0]), n),
-                        jnp.full(2 * n, -1.0)])
-        q = jnp.concat([jnp.zeros(n), jnp.ones(1)])
-        b = jnp.concat([point - self.centre, jnp.zeros(2 * n)])
-
-        return solver.solve(p, a, q, b).x[n] <= 1.0 + 1e-6
 
     def _make_contains_zonotope(self: ZonotopeType["d"],
                                 inner: ZonotopeType["d"]

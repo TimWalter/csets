@@ -14,6 +14,14 @@ class Config:
 config = Config()
 
 
+def _jax_has_cuda() -> bool:
+    import jax
+    try:
+        return bool(jax.devices("cuda"))
+    except RuntimeError:
+        return False
+
+
 class MoreauSolver(Solver):
     """Moreau solver with a customised auto-tune procedure, such that it is executed at construction time."""
 
@@ -21,6 +29,7 @@ class MoreauSolver(Solver):
                  n: int,
                  auto_tune_call: Callable[[Solver], Any] | None = None,
                  settings: Settings | None = None,
+                 enable_grad: bool | None = None,
                  **kwargs):
         """
         Requires keyword arguments.
@@ -29,14 +38,17 @@ class MoreauSolver(Solver):
             n: Number of primal variables
             auto_tune_call: First solve for auto-tuning.
             settings: Optional solver settings (moreau.Settings object).
+            enable_grad: Whether the solve is differentiable; defaults to `config.enable_grad`.
+                         False where only a decision is read off the solution.
         """
         if settings is None:
             settings = Settings()
         if config.device is not None:
             settings.device = config.device
         else:
-            settings.device = 'cpu' if n < 500 else 'auto'  # Moreau to eagerly assign GPU
-        settings.enable_grad = config.enable_grad
+            # Moreau to eagerly assign GPU, but only one JAX can use: Moreau's CUDA path needs JAX's.
+            settings.device = 'cpu' if n < 500 or not _jax_has_cuda() else 'auto'
+        settings.enable_grad = config.enable_grad if enable_grad is None else enable_grad
         super().__init__(n=n, settings=settings, **kwargs)
         if auto_tune_call is not None:
             auto_tune_call(self)
@@ -111,36 +123,35 @@ class ContinuousSet(Protocol):
         ...
 
     def make_contains(self: ContinuousSetType["d"],
-                      inner: ContinuousSetType["d"] | Float[Array, "d"],
-                      ) -> MoreauSolver:
+                      inner: ContinuousSetType["d"] | Float[Array, "*n d"],
+                      ) -> Any:
         r"""
-        Set up the optimisation problem for the containment check, reusable across calls as long as the
-        shapes and type stay the same.
+        Set up the containment check, reusable across calls as long as the shapes and type stay the same.
 
         Args:
-            inner: An example of the kind of continuous set or point, whose containment to check.
+            inner: An example of the kind of continuous set or point(s), whose containment to check.
 
         Returns:
-            A moreau solver; consume it through `contains`.
+            What `contains` consumes: a Moreau solver, or for points a `PointContainment`.
         """
         ...
 
     def contains(self: ContinuousSetType["d"],
-                 inner: ContinuousSetType["d"] | Float[Array, "d"],
-                 solver: MoreauSolver
-                 ) -> Bool[Array, ""]:
+                 inner: ContinuousSetType["d"] | Float[Array, "*n d"],
+                 solver: Any
+                 ) -> Bool[Array, "*n"]:
         """
-        Checks if a continuous set or point is contained in the continuous set.
+        Checks if a continuous set, a point, or each of several points is contained in the continuous set.
 
         The solver must have been constructed via `make_contains` with an `inner` of the same type
-        and shape, and with a continuous set of the same shape as `self`.
+        (and, for sets, shape), and with a continuous set of the same shape as `self`.
 
         Args:
-            inner: The continuous set or point to check.
-            solver: Pre-compiled moreau solver.
+            inner: The continuous set, point (d,) or points (n, d) to check.
+            solver: What `make_contains` returned.
 
         Returns:
-            Flag indicating containment.
+            Flag indicating containment, one per point for several points.
 
         Notes:
             Could also override the __contains__ operator.
