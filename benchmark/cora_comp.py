@@ -15,7 +15,8 @@ Without a daemon, run_instance.sh calls this file directly
 measurement. See https://github.com/CORA-COMP/benchmarks for the operations.
 
 Batched benchmarks (`batch_size` present) apply the operation to the whole batch in one
-`jax.vmap`ped call; unbatched ones call the library directly.
+`jax.vmap`ped call; unbatched ones call the library directly. How a batched CPU instance uses the
+cores is configured in benchmark/config.env (see there).
 """
 import json
 import sys
@@ -31,111 +32,107 @@ FINISHED, UNSUPPORTED, ERROR = "finished", "unsupported", "error"
 SEED = 0  # every instance starts from the same key, so a warm daemon behaves like a fresh process
 
 
-def write_result(path: str, verdict: str, **extra: float) -> None:
+def write_result(path: str, verdict: str, **extra: float | int) -> None:
     columns = ["result", *extra]
-    values = [verdict, *(f"{v:.6f}" for v in extra.values())]
+    values = [verdict, *(f"{v:.6f}" if isinstance(v, float) else str(v) for v in extra.values())]
     with open(path, "w") as f:
         f.write(",".join(columns) + "\n" + ",".join(values) + "\n")
 
 
-def random_zonotopes(key, batch: int | None, dim: int, generators: int):
-    """A random zonotope, or a batch of them (leading axis `batch`) when batched."""
-    if batch is None:
-        return Zonotope.random(key, dim=dim, nr_generators=generators)
-    return jax.vmap(lambda k: Zonotope.random(k, dim=dim, nr_generators=generators))(jax.random.split(key, batch))
+def unit_direction(key, dim: int):
+    d = jax.random.normal(key, (dim,))
+    return d / jnp.linalg.norm(d)
 
 
-def unit_directions(key, batch: int | None, dim: int):
-    shape = (dim,) if batch is None else (batch, dim)
-    d = jax.random.normal(key, shape)
-    return d / jnp.linalg.norm(d, axis=-1, keepdims=True)
-
-
-def programs(params: dict):
+def per_set(params: dict):
     """
-    Return `(generate, operation)` for the instance, both still to be jitted:
-    `generate()` makes the inputs, and `operation(i, inputs)` is repetition `i`, which folds `i`
-    into its key so random operations draw fresh numbers each time.
+    The instance as seen by one set: `make(key)` its inputs, `shared(key)` inputs common to the
+    whole batch (matMul's matrix), and `apply(key, inputs, shared)` one repetition on it.
     """
     operation = params["operation"]
     dim, generators = params["dim"], params["generators"]
-    batch = params.get("batch_size")  # absent on the unbatched benchmarks
+    points = params.get("points")
 
-    def input_keys():
-        return jax.random.split(jax.random.PRNGKey(SEED), 2)
+    def zonotope(key):
+        return Zonotope.random(key, dim=dim, nr_generators=generators)
 
-    def rep_key(i):
-        return jax.random.fold_in(jax.random.PRNGKey(SEED + 1), i)
+    def two(key, first, second):
+        k1, k2 = jax.random.split(key)
+        return first(k1), second(k2)
 
-    if operation == "startup":
-        return (lambda: ()), lambda i, _: Zonotope.random(rep_key(i), dim=dim, nr_generators=generators)
+    def nothing(_):
+        return ()
 
-    if operation == "generateRandom":
-        return (lambda: ()), lambda i, _: random_zonotopes(rep_key(i), batch, dim, generators)
-
+    if operation in ("startup", "generateRandom"):
+        return nothing, nothing, lambda key, inputs, shared: zonotope(key)
     if operation == "randPoint":
-        points = params["points"]
-
-        def generate():
-            return (random_zonotopes(input_keys()[0], batch, dim, generators),)
-
-        if batch is None:
-            return generate, lambda i, inputs: inputs[0].sample(rep_key(i), points)
-        return generate, lambda i, inputs: jax.vmap(lambda zi, ki: zi.sample(ki, points))(
-            inputs[0], jax.random.split(rep_key(i), batch))
-
+        return zonotope, nothing, lambda key, z, shared: z.sample(key, points)
     if operation == "supportFunc":
-        def generate():
-            k1, k2 = input_keys()
-            return random_zonotopes(k1, batch, dim, generators), unit_directions(k2, batch, dim)
-
-        if batch is None:
-            return generate, lambda i, inputs: inputs[0].support(inputs[1])
-        return generate, lambda i, inputs: jax.vmap(lambda zi, di: zi.support(di))(*inputs)
-
+        return (lambda key: two(key, zonotope, lambda k: unit_direction(k, dim)), nothing,
+                lambda key, inputs, shared: inputs[0].support(inputs[1]))
     if operation == "matMul":
-        def generate():
-            k1, k2 = input_keys()
-            # one matrix for the whole batch, per the catalog
-            return jax.random.normal(k2, (dim, dim)), random_zonotopes(k1, batch, dim, generators)
-
-        if batch is None:
-            return generate, lambda i, inputs: inputs[0] @ inputs[1]
-        return generate, lambda i, inputs: jax.vmap(lambda zi: inputs[0] @ zi)(inputs[1])
-
+        # one matrix for the whole batch, per the catalog
+        return zonotope, lambda key: jax.random.normal(key, (dim, dim)), lambda key, z, matrix: matrix @ z
     if operation == "minkSum":
-        def generate():
-            k1, k2 = input_keys()
-            return random_zonotopes(k1, batch, dim, generators), random_zonotopes(k2, batch, dim, generators)
-
-        if batch is None:
-            return generate, lambda i, inputs: inputs[0].minkowski_sum(inputs[1])
-        return generate, lambda i, inputs: jax.vmap(lambda a, b: a.minkowski_sum(b))(*inputs)
-
+        return (lambda key: two(key, zonotope, zonotope), nothing,
+                lambda key, inputs, shared: inputs[0].minkowski_sum(inputs[1]))
     if operation == "contains":
-        points = params["points"]
         # The containment check depends on the shapes only, so it is set up from zeros of the
         # instance's shape, not from the instance's sets. It takes all points of a set at once.
         example = Zonotope(centre=jnp.zeros(dim), generator=jnp.zeros((dim, generators)))
         solver = example.make_contains(jnp.zeros((points, dim)))
 
-        if batch is None:
-            def generate():
-                k1, k2 = input_keys()
-                z = random_zonotopes(k1, batch, dim, generators)
-                return z, z.sample(k2, points)
-
-            return generate, lambda i, inputs: inputs[0].contains(inputs[1], solver)
-
-        # `points` points per set, drawn from that set.
-        def generate():
-            k1, k2 = input_keys()
-            z = random_zonotopes(k1, batch, dim, generators)
-            return z, jax.vmap(lambda zi, ki: zi.sample(ki, points))(z, jax.random.split(k2, batch))
-
-        return generate, lambda i, inputs: jax.vmap(lambda zi, pi: zi.contains(pi, solver))(*inputs)
-
+        def make(key):
+            k1, k2 = jax.random.split(key)
+            z = zonotope(k1)
+            return z, z.sample(k2, points)
+        return make, nothing, lambda key, inputs, shared: inputs[0].contains(inputs[1], solver)
     raise ValueError(f"Unknown operation '{operation}'")
+
+
+def programs(params: dict, set_program=None, stream: int = 0):
+    """
+    Return `(generate, operation)` for the instance, both still to be jitted: `generate()` makes
+    the inputs, and `operation(i, inputs)` is repetition `i`, which folds `i` into its keys so
+    random operations draw fresh numbers each time. A batched instance is the per-set program
+    under `jax.vmap`.
+
+    Args:
+        params: The instance; for one shard of a split batch, with that shard's `batch_size`.
+        set_program: `per_set(params)`, when already built (the shards of a batch share it).
+        stream: Folded into every key, so that each shard of a split batch draws its own sets.
+    """
+    make, shared, apply = set_program or per_set(params)
+    batch = params.get("batch_size")  # absent on the unbatched benchmarks
+    set_key, shared_key, rep_key = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(SEED), stream), 3)
+
+    if batch is None:
+        def generate():
+            return make(set_key), shared(shared_key)
+
+        def operation(i, inputs):
+            return apply(jax.random.fold_in(rep_key, i), inputs[0], inputs[1])
+        return generate, operation
+
+    def generate():
+        return jax.random.split(rep_key, batch), jax.vmap(make)(jax.random.split(set_key, batch)), shared(shared_key)
+
+    def operation(i, inputs):
+        keys, sets, common = inputs
+        return jax.vmap(lambda k, s: apply(jax.random.fold_in(k, i), s, common))(keys, sets)
+    return generate, operation
+
+
+def shards_for(params: dict) -> int:
+    """
+    How many CPU devices a batched CPU instance is split across: the most that divide the batch.
+    There is more than one only when benchmark/config.env splits the CPU into devices.
+    """
+    batch = params.get("batch_size")
+    if params["device"] != "cpu" or batch is None:
+        return 1
+    devices = len(jax.devices("cpu"))
+    return max(k for k in range(1, min(devices, batch) + 1) if batch % k == 0)
 
 
 def configure(params: dict):
@@ -151,7 +148,15 @@ def configure(params: dict):
 
 
 class Instance:
-    """One catalog instance: shape-only setup in the constructor and `compile`, the measured part in `run`."""
+    """
+    One catalog instance: shape-only setup in the constructor and `compile`, the measured part in `run`.
+
+    A batched CPU instance may be split into shards, one per XLA CPU device (see benchmark/config.env):
+    each device gets its slice of the batch and its own compiled copy of the ordinary batched
+    program, and every repetition is dispatched to all of them, which run in parallel. Splitting
+    by hand rather than by `shard_map` keeps Moreau's host callback (the containment fallback)
+    out of a sharded program, where it crashes XLA.
+    """
 
     def __init__(self, params: dict):
         self.params = params
@@ -163,35 +168,44 @@ class Instance:
         if self.device is None:
             self.unsupported = f"no {params['device']} device available to JAX"
             return
+        self.shards = shards_for(params)
+        self.devices = jax.devices("cpu")[:self.shards] if self.shards > 1 else [self.device]
+        shard_params = dict(params, batch_size=params["batch_size"] // self.shards) if self.shards > 1 else params
         with jax.default_device(self.device):
-            generate, operation = programs(params)
+            set_program = per_set(params)
         # Moreau's JAX bindings find their solver through a weak registry, and a compiled program
-        # holds only the solver's id; these closures are what keeps the solver (the containment
+        # holds only the solver's id; this reference is what keeps the solver (the containment
         # check's LP fallback) alive.
-        self._programs = generate, operation
-        self.generate, self.operation = jax.jit(generate), jax.jit(operation)
+        self._set_program = set_program
+        self.generate, self.operation = [], []
+        for k, device in enumerate(self.devices):
+            with jax.default_device(device):
+                generate, operation = programs(shard_params, set_program, stream=k)
+            self.generate.append(jax.jit(generate, device=device) if self.shards > 1 else jax.jit(generate))
+            self.operation.append(jax.jit(operation, device=device) if self.shards > 1 else jax.jit(operation))
 
     def compile(self) -> None:
-        """Compile both programs from shapes alone; no input is generated."""
+        """Compile every shard's programs from shapes alone; no input is generated."""
         if self.unsupported:
             return
-        with jax.default_device(self.device):
-            lowered = self.generate.lower()
-            shapes = lowered.out_info
-            self.generate = lowered.compile()
-            self.operation = self.operation.lower(0, shapes).compile()
+        for k, device in enumerate(self.devices):
+            with jax.default_device(device):
+                self.generate[k] = self.generate[k].lower().compile()
+                self.operation[k] = self.operation[k].lower(0, self.generate[k].out_info).compile()
 
     def run(self):
         """Generate the inputs, then repeat the operation; return (time_generate, time_operation, output)."""
         with jax.default_device(self.device):
             t0 = time.perf_counter()
-            inputs = self.generate()
+            inputs = [generate() for generate in self.generate]
             jax.block_until_ready(inputs)
             t1 = time.perf_counter()
             for i in range(self.params["repetition"]):
-                output = self.operation(i, inputs)  # overwritten each time, like `Z2 = M * Z` in CORA
-            jax.block_until_ready(output)  # like wait(gpuDevice): calls return before the work is done
+                # dispatched asynchronously: the shards' devices work on them at the same time
+                outputs = [operation(i, x) for operation, x in zip(self.operation, inputs)]  # overwritten, like `Z2 = M * Z` in CORA
+            jax.block_until_ready(outputs)  # like wait(gpuDevice): calls return before the work is done
             t2 = time.perf_counter()
+        output = outputs[0] if len(outputs) == 1 else jax.tree.map(lambda *xs: jnp.concatenate([jax.device_get(x) for x in xs]), *outputs)
         return t1 - t0, t2 - t1, output
 
 
@@ -213,7 +227,8 @@ def run_instance(instance: Instance, result_file: str) -> str:
         if n_true != output.size:
             verdict = ERROR
 
-    write_result(result_file, verdict, time_generate=time_generate, time_operation=time_operation)
+    write_result(result_file, verdict, time_generate=time_generate, time_operation=time_operation,
+                 shards=instance.shards)
     print(f"{verdict}: generate {time_generate:.3f}s, operation {time_operation:.3f}s ({params['repetition']} reps)")
     return verdict
 

@@ -26,3 +26,10 @@ uv --version
 uv sync --frozen --no-dev
 
 .venv/bin/python -W ignore -c "import jax, moreau; print('jax', jax.__version__, 'moreau', moreau.__version__, 'devices', jax.devices())"
+
+# The worker, for choosing benchmark/config.env's CPU settings.
+echo "--- worker: $(nproc) CPUs available to this process"
+lscpu | grep -E "^(Model name|Socket|Core|Thread|CPU\(s\)|NUMA node\(s\))" || true
+free -g | head -2 || true
+nvidia-smi -L 2>/dev/null || echo "nvidia-smi: not present"
+. ./benchmark/config.env; echo "benchmark/config.env: CSETS_CPU_DEVICES=$CSETS_CPU_DEVICES"

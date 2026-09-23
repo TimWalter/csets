@@ -50,6 +50,7 @@ case "$PARAMS" in
     *'"device": "gpu"'*|*'"device":"gpu"'*) export JAX_PLATFORMS=cuda,cpu ;;
     *) export JAX_PLATFORMS=cpu ;;
 esac
+HERE=. && export XLA_FLAGS="$(xla_flags)"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONWARNINGS=ignore
 

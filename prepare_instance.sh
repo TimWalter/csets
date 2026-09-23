@@ -46,11 +46,12 @@ if [ -n "$PID" ] && grep -qa "benchmark/server.py" "/proc/$PID/cmdline" 2>/dev/n
     for _ in $(seq 50); do ask ping 1; [ $? -eq 1 ] && break; sleep 0.1; done
 fi
 
-echo "[prepare] starting the csets daemon"
+FLAGS="$(xla_flags)"
+echo "[prepare] starting the csets daemon (XLA_FLAGS='$FLAGS')"
 # Own session, so the harness's process-group kill of a timed-out run leaves it alone, and no
 # inherited stdout, which the harness waits on. JAX gets every platform: the daemon serves cpu
 # and gpu instances, and Moreau's JAX bindings need the CPU backend in either case.
-( cd "$HERE" && unset JAX_PLATFORMS && PYTHONWARNINGS=ignore exec setsid "$PYTHON" benchmark/server.py "$SRV_DIR" ) \
+( cd "$HERE" && unset JAX_PLATFORMS && XLA_FLAGS="$FLAGS" PYTHONWARNINGS=ignore exec setsid "$PYTHON" benchmark/server.py "$SRV_DIR" ) \
     > "$SRV_DIR/server.log" 2>&1 < /dev/null &
 
 SECONDS=0

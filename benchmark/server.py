@@ -71,7 +71,8 @@ def warm_up() -> None:
                 instance.compile()
                 with contextlib.redirect_stdout(open(os.devnull, "w")):
                     cora_comp.run_instance(instance, os.devnull)
-    print(f"[csets] warmed up on {', '.join(devices)}", flush=True)
+    print(f"[csets] warmed up on {', '.join(devices)}; {len(jax.devices('cpu'))} XLA CPU device(s), "
+          f"XLA_FLAGS={os.environ.get('XLA_FLAGS', '')!r}", flush=True)
 
 
 def handle(request: str, log_path: str) -> str:

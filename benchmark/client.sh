@@ -23,3 +23,12 @@ ask() {
     exec 3>&-
     return 0
 }
+
+# xla_flags: the XLA_FLAGS for benchmark/config.env's CPU settings.
+xla_flags() {
+    . "$HERE/benchmark/config.env"
+    local devices="$CSETS_CPU_DEVICES" flags=""
+    [ "$devices" = auto ] && devices="$(nproc)"
+    [ "$devices" -gt 1 ] 2>/dev/null && flags="--xla_force_host_platform_device_count=$devices"
+    echo "${XLA_FLAGS:+$XLA_FLAGS }$flags"
+}
