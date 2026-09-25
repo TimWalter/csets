@@ -78,15 +78,16 @@ def per_set(params: dict):
                 lambda key, inputs, shared: inputs[0].minkowski_sum(inputs[1]))
     if operation == "contains":
         # The containment check depends on the shapes only, so it is set up from zeros of the
-        # instance's shape, not from the instance's sets. It takes all points of a set at once.
+        # instance's shape, not from the instance's sets.
         example = Zonotope(centre=jnp.zeros(dim), generator=jnp.zeros((dim, generators)))
-        solver = example.make_contains(jnp.zeros((points, dim)))
+        solver = example.make_contains(jnp.zeros(dim))
 
         def make(key):
             k1, k2 = jax.random.split(key)
             z = zonotope(k1)
             return z, z.sample(k2, points)
-        return make, nothing, lambda key, inputs, shared: inputs[0].contains(inputs[1], solver)
+        # vmap over the points: they share the zonotope's factorisation, as in one call
+        return make, nothing, lambda key, inputs, shared: jax.vmap(lambda p: inputs[0].contains(p, solver))(inputs[1])
     raise ValueError(f"Unknown operation '{operation}'")
 
 
@@ -136,13 +137,12 @@ def shards_for(params: dict) -> int:
 
 
 def configure(params: dict):
-    """Return the JAX device for the instance (None if there is none) and pin csets to it."""
+    """Return the JAX device for the instance (None if there is none) and switch off gradients."""
     try:
         device = jax.devices("cuda" if params["device"] == "gpu" else "cpu")[0]
     except RuntimeError:
         return None
-    # Pin the Moreau solver to the instance's device too; by default csets picks by problem size.
-    csets.config.device = "cuda" if params["device"] == "gpu" else "cpu"
+    # Moreau's layers follow JAX's default device, which Instance sets to this one while building.
     csets.config.enable_grad = False
     return device
 

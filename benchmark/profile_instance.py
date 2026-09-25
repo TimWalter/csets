@@ -95,25 +95,23 @@ def main() -> None:
     phase(f"backend init ({device.platform})")
 
     instance = cora_comp.Instance(params)
-    phase("Instance(): programs + Moreau solver (shapes only)")
-    lowered = instance.generate.lower()
-    instance.generate = lowered.compile()
+    phase(f"Instance(): programs + Moreau solver (shapes only, {instance.shards} shard(s))")
+    # As Instance.compile, but timed per program: one generate and one operation per shard.
+    for k, shard_device in enumerate(instance.devices):
+        with jax.default_device(shard_device):
+            instance.generate[k] = instance.generate[k].lower().compile()
     phase("compile generate (shapes only)")
-    instance.operation = instance.operation.lower(0, lowered.out_info).compile()
+    for k, shard_device in enumerate(instance.devices):
+        with jax.default_device(shard_device):
+            instance.operation[k] = instance.operation[k].lower(0, instance.generate[k].out_info).compile()
     phase("compile operation (shapes only)")
     daemon_start = len(phases)  # everything above runs in prepare_instance.sh with the daemon
 
     reps = params["repetition"]
-    with jax.default_device(device):
-        inputs = instance.generate()
-        jax.block_until_ready(inputs)
-        phase("[timed] generate inputs")
-        from contextlib import nullcontext
-        with jax.profiler.trace(args.trace) if args.trace else nullcontext():
-            for i in range(reps):
-                output = instance.operation(i, inputs)
-            jax.block_until_ready(output)
-        phase(f"[timed] operation x{reps}")
+    from contextlib import nullcontext
+    with jax.profiler.trace(args.trace) if args.trace else nullcontext():
+        time_generate, time_operation, output = instance.run()  # the measured part, as the daemon runs it
+    phases += [("[timed] generate inputs", time_generate), (f"[timed] operation x{reps}", time_operation)]
 
     total = sum(dt for _, dt in phases if dt == dt)  # a NaN spawn age (off Linux) is skipped
     timed = sum(dt for _, dt in phases[daemon_start:])

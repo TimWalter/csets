@@ -5,11 +5,9 @@ requires-python = ">=3.14"
 dependencies = [
     "beartype>=0.22.9",
     "jaxtyping>=0.3.9",
-    "chex>=0.1.92",
     "jax[cuda13]>=0.10.1",
-    "moreau[cuda13]==0.4.1",
+    "cvxpylayers[jax]>=1.2.0",
+    "moreau[cuda13]>=0.4.1",
     "pytest>=9.1.0",
-    "linrax>=0.3.0",
+    "scipy-stubs~=1.18.1",
 ]
-
-
