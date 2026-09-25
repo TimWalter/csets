@@ -7,6 +7,7 @@ with install_import_hook("csets", "beartype.beartype"):
     from .solver import Solver
     from .types import ContinuousSetTypeClass, ContinuousSetType, ContinuousSet
     from .polytope import Polytope
+    from .interval import Interval
     from .zonotope import Zonotope
 
-__all__ = ["Config", "config", "Solver", "ContinuousSetTypeClass", "ContinuousSetType", "ContinuousSet", "Polytope", "Zonotope"]
+__all__ = ["Config", "config", "Solver", "ContinuousSetTypeClass", "ContinuousSetType", "ContinuousSet", "Interval", "Polytope", "Zonotope"]

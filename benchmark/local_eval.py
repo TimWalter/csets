@@ -245,7 +245,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="run instances like the platform does")
-    r.add_argument("--benchmark", action="append", help="benchmark(s) to run; default test, zonotope, zonotope-batched")
+    r.add_argument("--benchmark", action="append", help="benchmark(s) to run; default test and every zonotope and interval benchmark")
     r.add_argument("--filter", help="regex on the instance name, e.g. 'matMul-(10|1000)d'")
     r.add_argument("--device", choices=["cpu", "gpu"])
     r.add_argument("--mode", choices=["all", "first", "random"], default="all", help="as on the submission form")
@@ -265,7 +265,7 @@ def main() -> None:
 
     args = p.parse_args()
     if args.cmd == "run":
-        args.benchmark = args.benchmark or ["test", "zonotope", "zonotope-batched"]
+        args.benchmark = args.benchmark or ["test", "zonotope", "zonotope-batched", "interval", "interval-batched"]
         out = run(args)
         if not args.no_compare:
             args.results = out

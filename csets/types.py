@@ -9,7 +9,7 @@ from .solver import Solver
 class ContinuousSetTypeClass:
     r"""
     Subscriptable annotation factory for continuous sets, mirroring `Float[Array, "d"]`:
-    `SetType(...)["d"]` annotates a set of dimension `d`.
+    `ContinuousSetTypeClass(...)["d"]` annotates a set of dimension `d`.
 
     A continuous set is a pytree of arrays. Every leaf shares the leading dimension `d`
     while its remaining axes (e.g. the number of generators) are left free, so
@@ -39,6 +39,11 @@ class ContinuousSetTypeClass:
 
 
 ContinuousSetType = ContinuousSetTypeClass()
+ZonotopeType = ContinuousSetTypeClass("Zonotope")
+IntervalType = ContinuousSetTypeClass("Interval")
+# TODO: a ContinuousSetTypeClass("Polytope") once Polytope is a continuous set: it lacks most of the protocol, and
+#  its anchors have no leading dimension d.
+PolytopeType = PyTree[Float[Array, "..."], "Polytope"]
 
 
 @runtime_checkable

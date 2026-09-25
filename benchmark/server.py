@@ -81,7 +81,10 @@ def handle(request: str, log_path: str) -> str:
         return "pong"
     if kind == "warm":
         try:
-            return "unsupported" if prepare(rest).unsupported else "compiled"
+            instance = prepare(rest)
+            if instance.unsupported:
+                return "unsupported"
+            return f"compiled, {instance.shards} shard(s)" + (f" (measured {instance.choice})" if instance.choice else "")
         except Exception:
             traceback.print_exc()
             return "warm failed"

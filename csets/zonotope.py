@@ -8,13 +8,11 @@ import jax.numpy as jnp
 
 from jaxtyping import Array, PRNGKeyArray, Float, Bool
 
-from .types import ContinuousSetTypeClass, ContinuousSetType
-from .polytope import Polytope
+from .types import ContinuousSetType, ZonotopeType, IntervalType, PolytopeType
 from .settings import config
 from .solver import Solver
 from .utils import safe_norm, pytree_dataclass, generalised_cross
 
-ZonotopeType = ContinuousSetTypeClass("Zonotope")
 
 
 @pytree_dataclass
@@ -110,17 +108,19 @@ class Zonotope:
         Returns:
             Support in the given direction.
         """
-        return direction @ self.centre + jnp.sum(direction @ self.generator, axis=-1)
+        return direction @ self.centre + jnp.abs(direction @ self.generator).sum()
 
     def interval(self: ZonotopeType["d"]
-                 ) -> ZonotopeType["d"]:  # TODO should return an actual interval object later
+                 ) -> IntervalType["d"]:
         r"""
-        Return the over-approximative interval in zonotope representation.
+        Compute the interval hull, the smallest interval containing the zonotope.
 
         Returns:
-            Interval in zonotope representation.
+            The interval with the zonotope's centre and radius $\sum_j |g_j|$.
         """
-        return Zonotope(centre=self.centre, generator=jnp.diag(jnp.linalg.norm(self.generator, ord=1, axis=-1)))
+        from .interval import Interval
+
+        return Interval(centre=self.centre, radius=jnp.abs(self.generator).sum(-1))
 
     def __rmatmul__(self: ZonotopeType["d"],
                     transform: Float[Array, "m d"]
@@ -289,7 +289,7 @@ class Zonotope:
                                    "enable_grad": False})
 
 
-    def polytope(self: ZonotopeType["d"]) -> Polytope:
+    def polytope(self: ZonotopeType["d"]) -> PolytopeType:
         r"""
         Convert the zonotope to a polytope in halfspace representation.
 
@@ -305,6 +305,8 @@ class Zonotope:
         normal = jnp.where(valid, halfspace / jnp.where(valid, length, 1), 0)
         reach = jnp.abs(normal @ self.generator).sum(-1)
         offset = normal @ self.centre
+
+        from .polytope import Polytope
 
         return Polytope(normal=jnp.concatenate([normal, -normal]),
                         anchor=jnp.concatenate([offset + reach, reach - offset]))

@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 
 import csets
-from csets import Zonotope
+from csets import Interval, Zonotope
 
 FINISHED, UNSUPPORTED, ERROR = "finished", "unsupported", "error"
 SEED = 0  # every instance starts from the same key, so a warm daemon behaves like a fresh process
@@ -50,11 +50,13 @@ def per_set(params: dict):
     whole batch (matMul's matrix), and `apply(key, inputs, shared)` one repetition on it.
     """
     operation = params["operation"]
-    dim, generators = params["dim"], params["generators"]
+    dim = params["dim"]
     points = params.get("points")
 
-    def zonotope(key):
-        return Zonotope.random(key, dim=dim, nr_generators=generators)
+    def random_set(key):
+        if params["set"] == "interval":
+            return Interval.random(key, dim=dim)
+        return Zonotope.random(key, dim=dim, nr_generators=params["generators"])
 
     def two(key, first, second):
         k1, k2 = jax.random.split(key)
@@ -64,28 +66,27 @@ def per_set(params: dict):
         return ()
 
     if operation in ("startup", "generateRandom"):
-        return nothing, nothing, lambda key, inputs, shared: zonotope(key)
+        return nothing, nothing, lambda key, inputs, shared: random_set(key)
     if operation == "randPoint":
-        return zonotope, nothing, lambda key, z, shared: z.sample(key, points)
+        return random_set, nothing, lambda key, s, shared: s.sample(key, points)
     if operation == "supportFunc":
-        return (lambda key: two(key, zonotope, lambda k: unit_direction(k, dim)), nothing,
+        return (lambda key: two(key, random_set, lambda k: unit_direction(k, dim)), nothing,
                 lambda key, inputs, shared: inputs[0].support(inputs[1]))
     if operation == "matMul":
         # one matrix for the whole batch, per the catalog
-        return zonotope, lambda key: jax.random.normal(key, (dim, dim)), lambda key, z, matrix: matrix @ z
+        return random_set, lambda key: jax.random.normal(key, (dim, dim)), lambda key, s, matrix: matrix @ s
     if operation == "minkSum":
-        return (lambda key: two(key, zonotope, zonotope), nothing,
+        return (lambda key: two(key, random_set, random_set), nothing,
                 lambda key, inputs, shared: inputs[0].minkowski_sum(inputs[1]))
     if operation == "contains":
-        # The containment check depends on the shapes only, so it is set up from zeros of the
-        # instance's shape, not from the instance's sets.
-        example = Zonotope(centre=jnp.zeros(dim), generator=jnp.zeros((dim, generators)))
-        solver = example.make_contains(jnp.zeros(dim))
+        # The containment check depends on the set's type and shape only, so it is set up from an
+        # example of them, not from the instance's sets.
+        solver = random_set(jax.random.PRNGKey(SEED)).make_contains(jnp.zeros(dim))
 
         def make(key):
             k1, k2 = jax.random.split(key)
-            z = zonotope(k1)
-            return z, z.sample(k2, points)
+            s = random_set(k1)
+            return s, s.sample(k2, points)
         # vmap over the points: they share the zonotope's factorisation, as in one call
         return make, nothing, lambda key, inputs, shared: jax.vmap(lambda p: inputs[0].contains(p, solver))(inputs[1])
     raise ValueError(f"Unknown operation '{operation}'")
@@ -156,42 +157,85 @@ class Instance:
     program, and every repetition is dispatched to all of them, which run in parallel. Splitting
     by hand rather than by `shard_map` keeps Moreau's host callback (the containment fallback)
     out of a sharded program, where it crashes XLA.
+
+    Splitting costs a fixed overhead per shard and repetition, and only pays off for operations that
+    do enough work per repetition, so `compile` measures both and keeps the faster; see there.
     """
 
     def __init__(self, params: dict):
         self.params = params
         self.unsupported = None
-        if params["set"] != "zonotope":
+        if params["set"] not in ("zonotope", "interval"):
             self.unsupported = f"csets has no {params['set']} representation"
             return
         self.device = configure(params)
         if self.device is None:
             self.unsupported = f"no {params['device']} device available to JAX"
             return
-        self.shards = shards_for(params)
-        self.devices = jax.devices("cpu")[:self.shards] if self.shards > 1 else [self.device]
-        shard_params = dict(params, batch_size=params["batch_size"] // self.shards) if self.shards > 1 else params
         with jax.default_device(self.device):
-            set_program = per_set(params)
-        # Moreau's JAX bindings find their solver through a weak registry, and a compiled program
-        # holds only the solver's id; this reference is what keeps the solver (the containment
-        # check's LP fallback) alive.
-        self._set_program = set_program
-        self.generate, self.operation = [], []
-        for k, device in enumerate(self.devices):
+            # Moreau's JAX bindings find their solver through a weak registry, and a compiled
+            # program holds only the solver's id; this reference is what keeps the solver (the
+            # containment check's LP fallback) alive.
+            self._set_program = per_set(params)
+        self.choice = None  # how compile() chose the number of shards, for the log
+        self.shards, self.devices, self.generate, self.operation = self._programs(shards_for(params))
+
+    def _programs(self, shards: int) -> tuple[int, list, list, list]:
+        """The instance's programs split into this many shards, jitted but not yet compiled."""
+        devices = jax.devices("cpu")[:shards] if shards > 1 else [self.device]
+        shard_params = dict(self.params, batch_size=self.params["batch_size"] // shards) if shards > 1 else self.params
+        generates, operations = [], []
+        for k, device in enumerate(devices):
             with jax.default_device(device):
-                generate, operation = programs(shard_params, set_program, stream=k)
-            self.generate.append(jax.jit(generate, device=device) if self.shards > 1 else jax.jit(generate))
-            self.operation.append(jax.jit(operation, device=device) if self.shards > 1 else jax.jit(operation))
+                generate, operation = programs(shard_params, self._set_program, stream=k)
+            generates.append(jax.jit(generate, device=device) if shards > 1 else jax.jit(generate))
+            operations.append(jax.jit(operation, device=device) if shards > 1 else jax.jit(operation))
+        return shards, devices, generates, operations
 
     def compile(self) -> None:
-        """Compile every shard's programs from shapes alone; no input is generated."""
+        """
+        Compile the programs from shapes alone. A batched CPU instance that could be split is also
+        compiled unsplit, and both are timed on generated inputs, which are discarded. The split is
+        kept only if a repetition takes at least a millisecond unsplit (below that, the split's
+        overhead dominates and the difference is within the measurement's noise) and the split is at
+        least 10% faster. This is untimed setup, like the compilation itself: it chooses how to run
+        the instance, from the instance's shape and the machine, and measures nothing of the run.
+        """
         if self.unsupported:
             return
-        for k, device in enumerate(self.devices):
-            with jax.default_device(device):
-                self.generate[k] = self.generate[k].lower().compile()
-                self.operation[k] = self.operation[k].lower(0, self.generate[k].out_info).compile()
+        candidates = [self._programs(1)] if self.shards > 1 else []
+        candidates.append((self.shards, self.devices, self.generate, self.operation))
+        for _, devices, generates, operations in candidates:
+            for k, device in enumerate(devices):
+                with jax.default_device(device):
+                    generates[k] = generates[k].lower().compile()
+                    operations[k] = operations[k].lower(0, generates[k].out_info).compile()
+        if len(candidates) > 1:
+            seconds = [self._seconds_per_repetition(generates, operations) for _, _, generates, operations in candidates]
+            unsplit, split = seconds
+            worth_it = unsplit >= 1e-3 and split < 0.9 * unsplit
+            self.shards, self.devices, self.generate, self.operation = candidates[1 if worth_it else 0]
+            self.choice = ", ".join(f"{shards} shard(s): {1e3 * t:.3f} ms" for (shards, *_), t in zip(candidates, seconds))
+
+    def _seconds_per_repetition(self, generates: list, operations: list) -> float:
+        """
+        Time the compiled programs on inputs generated for the purpose: one repetition to warm up,
+        then repetitions dispatched back to back, as `run` does, until they take 0.1 s (at most
+        100); if one repetition already takes over a second, that one is the estimate.
+        """
+        with jax.default_device(self.device):
+            inputs = [generate() for generate in generates]
+            start = time.perf_counter()
+            jax.block_until_ready([operation(0, x) for operation, x in zip(operations, inputs)])
+            first = time.perf_counter() - start
+            if first > 1:
+                return first
+            repetitions = max(3, min(100, int(0.1 / max(first, 1e-6))))
+            start = time.perf_counter()
+            for i in range(1, repetitions + 1):
+                outputs = [operation(i, x) for operation, x in zip(operations, inputs)]
+            jax.block_until_ready(outputs)
+            return (time.perf_counter() - start) / repetitions
 
     def run(self):
         """Generate the inputs, then repeat the operation; return (time_generate, time_operation, output)."""
