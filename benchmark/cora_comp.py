@@ -125,23 +125,25 @@ def programs(params: dict, set_program=None, stream: int = 0):
     return generate, operation
 
 
-MAX_SHARDS = 20  # most shards measured: each costs a compilation in prepare and a dispatch per repetition
+PREPARE_BUDGET = 400  # seconds after which no further split is compiled; the harness allows 600 per prepare
 
 
 def shard_counts(params: dict) -> list[int]:
     """
     The numbers of shards worth measuring for an instance. Only a batched CPU instance on a CPU split
-    into devices (see benchmark/config.env) has more than one: besides 1, the most that divide the
-    batch (at most `MAX_SHARDS`) and one between, near their square root, since the split's gain and
-    its overhead both grow with the number of shards.
+    into devices (see benchmark/config.env) has more than one: from 1 up to the most that divide the
+    batch, in about geometric steps (1, 4, 20, 100 on a hundred devices), since which is fastest
+    ranges over all of them: heavy, memory-bound operations gain from every core, lighter ones lose
+    to the overhead each shard adds per repetition.
     """
     batch = params.get("batch_size")
     if params["device"] != "cpu" or batch is None:
         return [1]
-    limit = min(len(jax.devices("cpu")), batch, MAX_SHARDS)
-    divisors = [k for k in range(1, limit + 1) if batch % k == 0]
-    between = max(k for k in divisors if k * k <= divisors[-1])
-    return sorted({1, between, divisors[-1]})
+    divisors = [k for k in range(1, min(len(jax.devices("cpu")), batch) + 1) if batch % k == 0]
+    most = divisors[-1]
+    third = max(k for k in divisors if k ** 3 <= most)          # about the cube root of the most
+    two_thirds = max(k for k in divisors if k ** 3 <= most ** 2)  # about its square
+    return sorted({1, third, two_thirds, most})
 
 
 def configure(params: dict):
@@ -206,26 +208,34 @@ class Instance:
         compiled split into each of `shard_counts`, and each is timed on generated inputs, which are
         discarded. A split is only tried if a repetition takes at least a millisecond unsplit (below
         that, a split's overhead dominates and the difference is within the measurement's noise), and
-        only kept if it is at least 10% faster than unsplit; the fastest such split wins. This is
-        untimed setup, like the compilation itself: it chooses how to run the instance, from the
-        instance's shape and the machine, and measures nothing of the run.
+        only kept if it is at least 10% faster than unsplit; the fastest such split wins. Larger splits
+        are not tried once one was slower than the one before, nor after `PREPARE_BUDGET` seconds,
+        since each shard is one more compilation. This is untimed setup, like the compilation itself:
+        it chooses how to run the instance, from the instance's shape and the machine, and measures
+        nothing of the run.
         """
         if self.unsupported:
             return
+        start = time.perf_counter()
         chosen = (self.shards, self.devices, self.generate, self.operation)  # unsplit, from __init__
         self._compile_programs(chosen)
         counts = shard_counts(self.params)
         if len(counts) > 1:
-            unsplit = fastest = self._seconds_per_repetition(chosen)
+            unsplit = fastest = previous = self._seconds_per_repetition(chosen)
             measured = [f"1 shard(s): {1e3 * unsplit:.3f} ms"]
             if unsplit >= 1e-3:
                 for shards in counts[1:]:
+                    if time.perf_counter() - start > PREPARE_BUDGET:
+                        break
                     candidate = self._programs(shards)
                     self._compile_programs(candidate)
                     seconds = self._seconds_per_repetition(candidate)
                     measured.append(f"{shards} shard(s): {1e3 * seconds:.3f} ms")
                     if seconds < min(fastest, 0.9 * unsplit):
                         chosen, fastest = candidate, seconds
+                    if seconds > previous:
+                        break
+                    previous = seconds
             self.choice = ", ".join(measured)
         self.shards, self.devices, self.generate, self.operation = chosen
 
