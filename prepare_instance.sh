@@ -28,7 +28,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 START_TIMEOUT="${CSETS_START_TIMEOUT:-600}"
 
 warm() {
-    ask "warm	$4" "${CSETS_WARM_TIMEOUT:-300}" && echo "[prepare] $3: $REPLY"
+    # Most of the harness's 600 s for a prepare: what compiles here is not compiled in the measurement.
+    ask "warm	$4" "${CSETS_WARM_TIMEOUT:-540}" && echo "[prepare] $3: $REPLY"
 }
 
 if ask ping 5 && [ "$REPLY" = pong ]; then

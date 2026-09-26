@@ -125,16 +125,23 @@ def programs(params: dict, set_program=None, stream: int = 0):
     return generate, operation
 
 
-def shards_for(params: dict) -> int:
+MAX_SHARDS = 20  # most shards measured: each costs a compilation in prepare and a dispatch per repetition
+
+
+def shard_counts(params: dict) -> list[int]:
     """
-    How many CPU devices a batched CPU instance is split across: the most that divide the batch.
-    There is more than one only when benchmark/config.env splits the CPU into devices.
+    The numbers of shards worth measuring for an instance. Only a batched CPU instance on a CPU split
+    into devices (see benchmark/config.env) has more than one: besides 1, the most that divide the
+    batch (at most `MAX_SHARDS`) and one between, near their square root, since the split's gain and
+    its overhead both grow with the number of shards.
     """
     batch = params.get("batch_size")
     if params["device"] != "cpu" or batch is None:
-        return 1
-    devices = len(jax.devices("cpu"))
-    return max(k for k in range(1, min(devices, batch) + 1) if batch % k == 0)
+        return [1]
+    limit = min(len(jax.devices("cpu")), batch, MAX_SHARDS)
+    divisors = [k for k in range(1, limit + 1) if batch % k == 0]
+    between = max(k for k in divisors if k * k <= divisors[-1])
+    return sorted({1, between, divisors[-1]})
 
 
 def configure(params: dict):
@@ -159,7 +166,8 @@ class Instance:
     out of a sharded program, where it crashes XLA.
 
     Splitting costs a fixed overhead per shard and repetition, and only pays off for operations that
-    do enough work per repetition, so `compile` measures both and keeps the faster; see there.
+    do enough work per repetition, so `compile` measures a few splits and keeps the fastest; see there.
+    Without `compile`, the instance runs unsplit.
     """
 
     def __init__(self, params: dict):
@@ -178,7 +186,7 @@ class Instance:
             # containment check's LP fallback) alive.
             self._set_program = per_set(params)
         self.choice = None  # how compile() chose the number of shards, for the log
-        self.shards, self.devices, self.generate, self.operation = self._programs(shards_for(params))
+        self.shards, self.devices, self.generate, self.operation = self._programs(1)
 
     def _programs(self, shards: int) -> tuple[int, list, list, list]:
         """The instance's programs split into this many shards, jitted but not yet compiled."""
@@ -195,34 +203,47 @@ class Instance:
     def compile(self) -> None:
         """
         Compile the programs from shapes alone. A batched CPU instance that could be split is also
-        compiled unsplit, and both are timed on generated inputs, which are discarded. The split is
-        kept only if a repetition takes at least a millisecond unsplit (below that, the split's
-        overhead dominates and the difference is within the measurement's noise) and the split is at
-        least 10% faster. This is untimed setup, like the compilation itself: it chooses how to run
-        the instance, from the instance's shape and the machine, and measures nothing of the run.
+        compiled split into each of `shard_counts`, and each is timed on generated inputs, which are
+        discarded. A split is only tried if a repetition takes at least a millisecond unsplit (below
+        that, a split's overhead dominates and the difference is within the measurement's noise), and
+        only kept if it is at least 10% faster than unsplit; the fastest such split wins. This is
+        untimed setup, like the compilation itself: it chooses how to run the instance, from the
+        instance's shape and the machine, and measures nothing of the run.
         """
         if self.unsupported:
             return
-        candidates = [self._programs(1)] if self.shards > 1 else []
-        candidates.append((self.shards, self.devices, self.generate, self.operation))
-        for _, devices, generates, operations in candidates:
-            for k, device in enumerate(devices):
-                with jax.default_device(device):
-                    generates[k] = generates[k].lower().compile()
-                    operations[k] = operations[k].lower(0, generates[k].out_info).compile()
-        if len(candidates) > 1:
-            seconds = [self._seconds_per_repetition(generates, operations) for _, _, generates, operations in candidates]
-            unsplit, split = seconds
-            worth_it = unsplit >= 1e-3 and split < 0.9 * unsplit
-            self.shards, self.devices, self.generate, self.operation = candidates[1 if worth_it else 0]
-            self.choice = ", ".join(f"{shards} shard(s): {1e3 * t:.3f} ms" for (shards, *_), t in zip(candidates, seconds))
+        chosen = (self.shards, self.devices, self.generate, self.operation)  # unsplit, from __init__
+        self._compile_programs(chosen)
+        counts = shard_counts(self.params)
+        if len(counts) > 1:
+            unsplit = fastest = self._seconds_per_repetition(chosen)
+            measured = [f"1 shard(s): {1e3 * unsplit:.3f} ms"]
+            if unsplit >= 1e-3:
+                for shards in counts[1:]:
+                    candidate = self._programs(shards)
+                    self._compile_programs(candidate)
+                    seconds = self._seconds_per_repetition(candidate)
+                    measured.append(f"{shards} shard(s): {1e3 * seconds:.3f} ms")
+                    if seconds < min(fastest, 0.9 * unsplit):
+                        chosen, fastest = candidate, seconds
+            self.choice = ", ".join(measured)
+        self.shards, self.devices, self.generate, self.operation = chosen
 
-    def _seconds_per_repetition(self, generates: list, operations: list) -> float:
+    def _compile_programs(self, programs: tuple[int, list, list, list]) -> None:
+        """Compile one split's programs from shapes alone, in place."""
+        _, devices, generates, operations = programs
+        for k, device in enumerate(devices):
+            with jax.default_device(device):
+                generates[k] = generates[k].lower().compile()
+                operations[k] = operations[k].lower(0, generates[k].out_info).compile()
+
+    def _seconds_per_repetition(self, programs: tuple[int, list, list, list]) -> float:
         """
         Time the compiled programs on inputs generated for the purpose: one repetition to warm up,
         then repetitions dispatched back to back, as `run` does, until they take 0.1 s (at most
         100); if one repetition already takes over a second, that one is the estimate.
         """
+        _, _, generates, operations = programs
         with jax.default_device(self.device):
             inputs = [generate() for generate in generates]
             start = time.perf_counter()
@@ -238,7 +259,11 @@ class Instance:
             return (time.perf_counter() - start) / repetitions
 
     def run(self):
-        """Generate the inputs, then repeat the operation; return (time_generate, time_operation, output)."""
+        """
+        Generate the inputs, then repeat the operation; return (time_generate, time_operation, outputs),
+        the last repetition's output of each shard. They stay where they were computed: gathering them
+        would add a copy of the whole result to the measurement.
+        """
         with jax.default_device(self.device):
             t0 = time.perf_counter()
             inputs = [generate() for generate in self.generate]
@@ -249,8 +274,7 @@ class Instance:
                 outputs = [operation(i, x) for operation, x in zip(self.operation, inputs)]  # overwritten, like `Z2 = M * Z` in CORA
             jax.block_until_ready(outputs)  # like wait(gpuDevice): calls return before the work is done
             t2 = time.perf_counter()
-        output = outputs[0] if len(outputs) == 1 else jax.tree.map(lambda *xs: jnp.concatenate([jax.device_get(x) for x in xs]), *outputs)
-        return t1 - t0, t2 - t1, output
+        return t1 - t0, t2 - t1, outputs
 
 
 def run_instance(instance: Instance, result_file: str) -> str:
@@ -261,14 +285,14 @@ def run_instance(instance: Instance, result_file: str) -> str:
         write_result(result_file, UNSUPPORTED)
         return UNSUPPORTED
 
-    time_generate, time_operation, output = instance.run()
+    time_generate, time_operation, outputs = instance.run()
 
     verdict = FINISHED
     if params["operation"] == "contains":
         # Every point was drawn from its set, so every answer must be true.
-        n_true = int(output.sum())
-        print(f"contains: {n_true}/{output.size} true")
-        if n_true != output.size:
+        n_true, n = sum(int(answers.sum()) for answers in outputs), sum(answers.size for answers in outputs)
+        print(f"contains: {n_true}/{n} true")
+        if n_true != n:
             verdict = ERROR
 
     write_result(result_file, verdict, time_generate=time_generate, time_operation=time_operation,

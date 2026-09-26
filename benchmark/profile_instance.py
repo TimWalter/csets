@@ -110,7 +110,7 @@ def main() -> None:
     reps = params["repetition"]
     from contextlib import nullcontext
     with jax.profiler.trace(args.trace) if args.trace else nullcontext():
-        time_generate, time_operation, output = instance.run()  # the measured part, as the daemon runs it
+        time_generate, time_operation, outputs = instance.run()  # the measured part, as the daemon runs it
     phases += [("[timed] generate inputs", time_generate), (f"[timed] operation x{reps}", time_operation)]
 
     total = sum(dt for _, dt in phases if dt == dt)  # a NaN spawn age (off Linux) is skipped
@@ -127,7 +127,7 @@ def main() -> None:
     print(f"  measured, without it (fresh process, lazy jit): ~{total * 1e3:9.1f} ms")
     print(f"  per repetition: {phases[-1][1] / reps * 1e3:.3f} ms")
     if params["operation"] == "contains":
-        print(f"  contains: {int(output.sum())}/{output.size} true")
+        print(f"  contains: {sum(int(o.sum()) for o in outputs)}/{sum(o.size for o in outputs)} true")
     if args.trace:
         print(f"  trace written to {args.trace} (open with Perfetto / TensorBoard)")
 
