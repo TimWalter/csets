@@ -1,19 +1,21 @@
+import math
+import itertools
 from typing import Literal
 
-import chex
 import jax
+import cvxpy as cp
 import jax.numpy as jnp
 
-from moreau.jax import Cones, Settings
-from jaxtyping import Array, Float, Bool, PRNGKeyArray
+from jaxtyping import Array, PRNGKeyArray, Float, Bool
 
-from . import MoreauSolver, SetType, ContinuousSetType
-from .utils import safe_norm
+from .types import ContinuousSetType, ZonotopeType, IntervalType, PolytopeType
+from .settings import config
+from .solver import Solver
+from .utils import safe_norm, pytree_dataclass, generalised_cross
 
-ZonotopeType = SetType("Zonotope")
 
 
-@chex.dataclass(frozen=True)
+@pytree_dataclass
 class Zonotope:
     r"""
     A zonotope is a convex set defined as
@@ -106,17 +108,19 @@ class Zonotope:
         Returns:
             Support in the given direction.
         """
-        return direction @ self.centre + jnp.sum(direction @ self.generator, axis=-1)
+        return direction @ self.centre + jnp.abs(direction @ self.generator).sum()
 
     def interval(self: ZonotopeType["d"]
-                 ) -> ZonotopeType["d"]:  # TODO should return an actual interval object later
+                 ) -> IntervalType["d"]:
         r"""
-        Return the over-approximative interval in zonotope representation.
+        Compute the interval hull, the smallest interval containing the zonotope.
 
         Returns:
-            Interval in zonotope representation.
+            The interval with the zonotope's centre and radius $\sum_j |g_j|$.
         """
-        return Zonotope(centre=self.centre, generator=jnp.diag(jnp.linalg.norm(self.generator, ord=1, axis=-1)))
+        from .interval import Interval
+
+        return Interval(centre=self.centre, radius=jnp.abs(self.generator).sum(-1))
 
     def __rmatmul__(self: ZonotopeType["d"],
                     transform: Float[Array, "m d"]
@@ -155,9 +159,10 @@ class Zonotope:
             generator=jnp.concat([self.generator, other.generator], axis=-1)
         )
 
+
     def make_contains(self: ZonotopeType["d"],
                       inner: ContinuousSetType["d"] | Float[Array, "d"],
-                      ) -> MoreauSolver:
+                      ) -> Solver | None:
         r"""
         Set up the optimisation problem for the containment check, reusable across calls as long as the
         shapes and type stay the same.
@@ -166,7 +171,7 @@ class Zonotope:
             inner: An example of the kind of continuous set or point, whose containment to check.
 
         Returns:
-            A moreau solver; consume it through `contains`.
+            A moreau solver, or None if the check needs none; consume it through `contains`.
         """
         if isinstance(inner, Zonotope):
             return self._make_contains_zonotope(inner)
@@ -177,17 +182,15 @@ class Zonotope:
 
     def contains(self: ZonotopeType["d"],
                  inner: ContinuousSetType["d"] | Float[Array, "d"],
-                 solver: MoreauSolver
+                 solver: Solver | None
                  ) -> Bool[Array, ""]:
         """
         Checks if a continuous set or point is contained in the zonotope.
 
-        The solver must have been constructed via `make_contains` with an `inner` of the same type
-        and shape, and with a zonotope of the same shape as `self`.
-
         Args:
             inner: The continuous set or point to check.
-            solver: Pre-compiled moreau solver.
+            solver: Pre-compiled solver, which must have been constructed via `make_contains` with an `inner`
+            of the same type and shape, and with a zonotope of the same shape as `self`.
 
         Returns:
             Flag indicating containment.
@@ -195,172 +198,167 @@ class Zonotope:
         Notes:
             Could also override the __contains__ operator.
         """
+        outer, inner = jax.lax.stop_gradient((self, inner))
         if isinstance(inner, Zonotope):
-            return self._contains_zonotope(inner, solver)
+            _, bound, residuals = solver(inner.centre, inner.generator, outer.centre, outer.generator)
+        elif isinstance(inner, Array) and solver is None:
+            return outer.polytope().contains(inner)
         elif isinstance(inner, Array):
-            return self._contains_point(inner, solver)
+            _, bound, residuals = solver(inner, outer.centre, outer.generator)
         else:
             raise TypeError(f"Unsupported type for inner: {type(inner)}")
+        return (residuals <= config.tolerance).all() & (bound <= 1 + config.tolerance)
 
-    def _make_contains_point(self: ZonotopeType["d"]) -> MoreauSolver:
+    def _make_contains_point(self: ZonotopeType["d"]) -> Solver | None:
         r"""
-        Build a solver for the point containment problem of a zonotope, namely
-        $1\geq\min_{\beta\in\mathbb{R}^n} \norm{\beta}_\infty\,, \text{s.t.} point=c+G\beta.
-        We canonicalise to:
-            min_z q^T z
-            s.t. A z + s = b, s \in K
-
-        with z=[\beta, t], q=[\bm{0}, 1], A=[[G, \bm{0}],
-                                             [I, -\bm{1}],
-                                             [-I, -\bm{1}]],
-        b=[p - c, \bm{0}, \bm{0}], and K a zero cone of dimension d followed by a non-negative cone.
+        Build the solver for the point containment LP, namely
+        $$
+        1\geq\min_{\beta\in\mathbb{R}^n} \norm{\beta}_\infty\,, \text{s.t.} p=c+G\beta\,.
+        $$
         See Kulmburg, A., Althoff, M. (2021): "On the co-NP-Completeness of the Zonotope Containment Problem", Eq. (6).
 
+        While the zonotope has few facets ($\binom{n}{d-1} \leq 300$), its halfspace representation decides
+        instead, and no solver is needed; this assumes the zonotope is full-dimensional. Otherwise the
+        alternating projections answer most points without the LP.
+
         Returns:
-            A moreau solver; consume it through `contains`.
+            A solver, called with (p, c, G), or None if the halfspace representation decides; consume it through
+            `contains`.
         """
         d, n = self.generator.shape
-
-        P_row_offsets = jnp.zeros(n + 2, dtype=jnp.int32)
-        P_col_indices = jnp.array([], dtype=jnp.int32)
-
-        A_row_offsets = jnp.concat([jnp.arange(0, d * n + 1, n), d * n + jnp.arange(2, 4 * n + 1, 2)])
-        bound_cols = jnp.stack([jnp.arange(n), jnp.full(n, n)], axis=1).flatten()
-        A_col_indices = jnp.concat([jnp.tile(jnp.arange(n), d), bound_cols, bound_cols])
-
-        cones = Cones(num_zero_cones=d, num_nonneg_cones=2 * n)
-
-        return MoreauSolver(n=n + 1, m=d + 2 * n,
-                            P_row_offsets=P_row_offsets, P_col_indices=P_col_indices,
-                            A_row_offsets=A_row_offsets, A_col_indices=A_col_indices,
-                            cones=cones,
-                            settings=Settings(solver='active_set'))
-
-    def _contains_point(self: ZonotopeType["d"],
-                        point: Float[Array, "d"],
-                        solver: MoreauSolver
-                        ) -> Bool[Array, ""]:
-        """
-        Check whether a point is contained in the zonotope, up to the solver tolerance.
-
-        Args:
-            point: The point to check.
-            solver: Pre-compiled moreau solver, constructed via `_make_contains_point`.
-
-        Returns:
-            Flag indicating containment.
-        """
-        n = self.generator.shape[1]
-
-        p = jnp.array([])
-        a = jnp.concat([self.generator.flatten(),
-                        jnp.tile(jnp.array([1.0, -1.0]), n),
-                        jnp.full(2 * n, -1.0)])
-        q = jnp.concat([jnp.zeros(n), jnp.ones(1)])
-        b = jnp.concat([point - self.centre, jnp.zeros(2 * n)])
-
-        return solver.solve(p, a, q, b).x[n] <= 1.0 + 1e-6
+        if n >= d and math.comb(n, d - 1) <= 300:
+            return None
+        parameters = [
+            point := cp.Parameter(d),
+            centre := cp.Parameter(d),
+            generator := cp.Parameter((d, n))
+        ]
+        variables = [
+            weights := cp.Variable(n)
+        ]
+        objective = cp.Minimize(cp.norm(weights, "inf"))
+        constraints = [
+            point == centre + generator @ weights
+        ]
+        problem = cp.Problem(objective, constraints)
+        heuristic = _alternating_projections if n >= d else None
+        return Solver(problem, parameters, variables, heuristic,
+                      solver="MOREAU",
+                      solver_args={"solver": "ipm",
+                                   "device": jnp.empty(0).device.platform.replace("gpu", "cuda"),
+                                   "enable_grad": False})
 
     def _make_contains_zonotope(self: ZonotopeType["d"],
                                 inner: ZonotopeType["d"]
-                                ) -> MoreauSolver:
+                                ) -> Solver:
         r"""
-        Build a solver for the zonotope containment problem of a zonotope, namely
+        Build the solver for the zonotope containment problem of a zonotope, namely
         $$
-        1\geq\min_{\beta\in\mathbb{R}^n_s, \Gamma\in\mathbb{R}^{n_s\times n_i}} \norm{[\beta, \Gamma]}_\infty
-        \text{s.t.} G_i=G_s\Gamma
-        c_s-c_i=G_s\beta
+        1\geq\min_{\beta\in\mathbb{R}^n_o, \Gamma\in\mathbb{R}^{n_o\times n_i}} \norm{[\Gamma, \beta]}_\infty
+        \text{s.t.} G_i=G_o\Gamma
+        c_o-c_i=G_o\beta\,.
         $$
-        We canonicalise the row sums through auxiliary variables U >= |\Gamma| and V >= |\beta| to:
-            min_z q^T z
-            s.t. A z + s = b, s \in K
-
-        with z=[\Gamma, \beta, U, V, t], q=[\bm{0}, 1], K a zero cone of dimension d (m + 1)
-        followed by a non-negative cone, and the rows of A grouped as
-            d m rows: G_1 \Gamma = G_2                     (zero cone)
-            d rows:   G_1 \beta = c_1 - c_2                (zero cone)
-            2 n m rows: +-\Gamma - U <= 0                  (non-negative cone)
-            2 n rows:   +-\beta - V <= 0                   (non-negative cone)
-            n rows:     \sum_j U_kj + V_k - t <= 0         (non-negative cone)
-
-        The encoding is sufficient but not necessary: exact zonotope containment is co-NP-complete, so a contained pair
-        may still be reported as not contained.
-
         See Sadraddini, S., Tedrake, R. (2019): "Linear Encodings for Polytope Containment Problems", Eq. (5)
 
         Returns:
-            A moreau solver; consume it through `contains`.
+            A solver, called with (c_i, G_i, c_o, G_o); consume it through `contains`.
+
+        Notes:
+            The condition is sufficient but not necessary, so a contained pair may still be reported as not contained.
         """
-        d, n = self.generator.shape
-        m = inner.generator.shape[1]
+        d, outer_n = self.generator.shape
+        inner_n = inner.generator.shape[1]
+        parameters = [
+            inner_centre := cp.Parameter(d),
+            inner_generator := cp.Parameter((d, inner_n)),
+            outer_centre := cp.Parameter(d),
+            outer_generator := cp.Parameter((d, outer_n))
+        ]
+        variables = [
+            weights := cp.Variable(outer_n),
+            mapping := cp.Variable((outer_n, inner_n))
+        ]
+        objective = cp.Minimize(cp.norm(cp.hstack([mapping, weights[:, None]]), "inf"))
+        constraints = [inner_generator == outer_generator @ mapping,
+                       outer_centre - inner_centre == outer_generator @ weights]
+        problem = cp.Problem(objective, constraints)
+        return Solver(problem, parameters, variables,
+                      solver="MOREAU",
+                      solver_args={"solver": "ipm",
+                                   "device": jnp.empty(0).device.platform.replace("gpu", "cuda"),
+                                   "enable_grad": False})
 
-        num_variables = 2 * n * m + 2 * n + 1
-        num_zero_cones = d * (m + 1)
-        num_nonneg_cones = 2 * n * m + 3 * n
 
-        P_row_offsets = jnp.zeros(num_variables + 1, dtype=jnp.int32)
-        P_col_indices = jnp.array([], dtype=jnp.int32)
-
-        row_sizes = jnp.concat([jnp.full(num_zero_cones, n, dtype=jnp.int32),
-                                jnp.full(2 * n * m + 2 * n, 2, dtype=jnp.int32),
-                                jnp.full(n, m + 2, dtype=jnp.int32)])
-        A_row_offsets = jnp.concat([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(row_sizes)])
-
-        mapping_cols = jnp.arange(n * m)
-        weight_cols = n * m + jnp.arange(n)
-        abs_mapping_cols = n * m + n + mapping_cols
-        abs_weight_cols = 2 * n * m + n + jnp.arange(n)
-        t_col = 2 * n * m + 2 * n
-
-        shape_cols = jnp.tile((jnp.arange(m)[:, None] + m * jnp.arange(n)[None, :]).flatten(), d)
-        centre_cols = jnp.tile(weight_cols, d)
-        mapping_bound_cols = jnp.stack([mapping_cols, abs_mapping_cols], axis=1).flatten()
-        weight_bound_cols = jnp.stack([weight_cols, abs_weight_cols], axis=1).flatten()
-        row_sum_cols = jnp.concat([abs_mapping_cols.reshape(n, m),
-                                   abs_weight_cols[:, None],
-                                   jnp.full((n, 1), t_col)], axis=1).flatten()
-
-        A_col_indices = jnp.concat([shape_cols, centre_cols,
-                                    mapping_bound_cols, mapping_bound_cols,
-                                    weight_bound_cols, weight_bound_cols,
-                                    row_sum_cols])
-
-        cones = Cones(num_zero_cones=num_zero_cones, num_nonneg_cones=num_nonneg_cones)
-
-        return MoreauSolver(n=num_variables, m=num_zero_cones + num_nonneg_cones,
-                            P_row_offsets=P_row_offsets, P_col_indices=P_col_indices,
-                            A_row_offsets=A_row_offsets, A_col_indices=A_col_indices,
-                            cones=cones,
-                            settings=Settings(solver='active_set'))
-
-    def _contains_zonotope(self: ZonotopeType["d"],
-                           inner: ZonotopeType["d"],
-                           solver: MoreauSolver
-                           ) -> Bool[Array, ""]:
-        """
-        Check whether another zonotope is contained in this one, up to the solver tolerance.
-
-        Args:
-            inner: The zonotope to check.
-            solver: Pre-compiled moreau solver, constructed via `_make_contains_zonotope`.
+    def polytope(self: ZonotopeType["d"]) -> PolytopeType:
+        r"""
+        Convert the zonotope to a polytope in halfspace representation.
 
         Returns:
-            Flag indicating containment.
+            The polytope, with $2\binom{n}{d-1}$ halfspaces.
         """
-        n = self.generator.shape[1]
-        m = inner.generator.shape[1]
+        d, n = self.generator.shape
+        subsets = jnp.array(list(itertools.combinations(range(n), d - 1)), dtype=jnp.int32)
+        halfspace = jax.vmap(generalised_cross)(self.generator[:, subsets].transpose(1, 0, 2))
 
-        p = jnp.array([])
-        a = jnp.concat([jnp.repeat(self.generator, m, axis=0).flatten(),
-                        self.generator.flatten(),
-                        jnp.tile(jnp.array([1.0, -1.0]), n * m),
-                        jnp.full(2 * n * m, -1.0),
-                        jnp.tile(jnp.array([1.0, -1.0]), n),
-                        jnp.full(2 * n, -1.0),
-                        jnp.tile(jnp.concat([jnp.ones(m + 1), jnp.array([-1.0])]), n)])
-        q = jnp.zeros(2 * n * m + 2 * n + 1).at[-1].set(1.0)
-        b = jnp.concat([inner.generator.flatten(),
-                        self.centre - inner.centre,
-                        jnp.zeros(2 * n * m + 3 * n)])
+        length = jnp.linalg.norm(halfspace, axis=-1, keepdims=True)
+        valid = length > 1e-9 * jnp.abs(self.generator).max() ** (d - 1)
+        normal = jnp.where(valid, halfspace / jnp.where(valid, length, 1), 0)
+        reach = jnp.abs(normal @ self.generator).sum(-1)
+        offset = normal @ self.centre
 
-        return solver.solve(p, a, q, b).x[-1] <= 1.0 + 1e-6
+        from .polytope import Polytope
+
+        return Polytope(normal=jnp.concatenate([normal, -normal]),
+                        anchor=jnp.concatenate([offset + reach, reach - offset]))
+
+
+def _alternating_projections(point: Float[Array, "d"],
+                             centre: Float[Array, "d"],
+                             generator: Float[Array, "d m"]
+                             ) -> tuple[Bool[Array, ""], tuple[Float[Array, "m"]]]:
+    r"""
+    Check if a point inside the zonotope by using the fact that the point is inside iff the affine subspace
+    $A = \{\beta \mid G\beta = r\}$, $r = p - c$, intersects the box $[-1, 1]^m$.
+    The projections alternate between $A$ and the shrunk box $[-s, s]^m$, $s = 0.9$.
+
+    Args:
+        point: The point.
+        centre: The zonotope's centre.
+        generator: The zonotope's generators.
+
+    Returns:
+        Flag indicating whether the solve was successful and the solution.
+    """
+    shrink = 0.9
+    G = generator
+    threshold = 1 + config.tolerance
+    factor = (jnp.linalg.cholesky(G @ G.T), True)
+    r = point - centre
+
+    def to_affine(x):
+        return x - G.T @ jax.scipy.linalg.cho_solve(factor, G @ x - r)
+
+    def project(x, times):
+        return jax.lax.fori_loop(0, times, lambda _, v: to_affine(jnp.clip(v, -shrink, shrink)), x)
+
+    def settles(x):
+        in_affine = jnp.abs(G @ x - r).max() <= 1e-9 * (1 + jnp.abs(r).max())
+        inside = jnp.abs(x).max() <= threshold
+        y = jax.scipy.linalg.cho_solve(factor, G @ (x - jnp.clip(x, -shrink, shrink)))
+        reach = jnp.abs(G.T @ y).sum()  # ||G'y||_1, the support of Z - c along y
+        rounding = 1000 * jnp.finfo(r.dtype).eps * (reach + jnp.abs(y * r).sum())
+        outside = y @ r - threshold * reach > rounding
+        return in_affine & (inside | outside)
+
+    def unsettled(state):
+        _, settled, projections = state
+        return (projections < 64) & ~settled
+
+    def step(state):
+        x, _, projections = state
+        x = project(x, 4)
+        return x, settles(x), projections + 4
+
+    x = project(G.T @ jax.scipy.linalg.cho_solve(factor, r), 16)
+    x, settled, _ = jax.lax.while_loop(unsettled, step, (x, settles(x), 16))
+    return settled, (x,)

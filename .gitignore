@@ -3,3 +3,7 @@
 .idea
 wsl.localhost
 **/__pycache__/
+# CORA-COMP local runs
+benchmark/.cache/
+benchmark/local_results/
+.server/
